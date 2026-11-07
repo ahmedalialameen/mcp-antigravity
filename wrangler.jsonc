@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "antigravity-mcp-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "OAUTH_KV"
+    }
+  ],
+  "vars": {
+    "MCP_RESOURCE": "https://antigravity-mcp-server.workers.dev/mcp"
+  }
+}
