@@ -1,12 +1,13 @@
 # Cloudflare Workers MCP Server for Google Antigravity Agent
 
-A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It bridges Claude (Claude Desktop, Claude Code, and Claude Web) to Google's Antigravity Agent runtime (code sandbox, file manipulation, and autonomous reasoning) over Streamable HTTP/SSE, secured via OAuth 2.1 with PKCE backed by Cloudflare KV.
+A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It bridges Claude (Claude Desktop, Claude Code, and Claude Web) to Google's Antigravity Agent runtime (code sandbox, file manipulation, and autonomous reasoning) over Streamable HTTP/SSE, secured via OAuth 2.1 with PKCE backed by Cloudflare KV and Cloudflare Durable Objects.
 
 ## Features
 
 - **Google Antigravity Integration**: Connects to `https://generativelanguage.googleapis.com/v1beta/models/antigravity:generateContent` using the official `x-goog-api-key: <GEMINI_API_KEY>` header.
 - **MCP Server & Tool**: Implements the `run_antigravity_agent` tool via `@modelcontextprotocol/sdk` to execute multi-step tasks and file manipulation within the sandbox workspace.
-- **OAuth 2.1 Provider**: Implements standard OAuth 2.1 routes (`/oauth/authorize`, `/oauth/token`, `/oauth/register`, `/.well-known/oauth-authorization-server`) backed by Cloudflare KV (`OAUTH_KV`).
+- **Durable Object Session Management**: Manages MCP SSE connections and message dispatching via `McpSessionDO` Durable Objects, enabling session stickiness and routing across distributed Worker instances, while safely cleaning up resources on client disconnect.
+- **Secure OAuth 2.1 with Configurable User Policy**: Implements OAuth 2.1 routes (`/oauth/authorize`, `/oauth/token`, `/oauth/register`, `/.well-known/oauth-authorization-server`) backed by Cloudflare KV (`OAUTH_KV`). Enforces configurable user authorization via `ALLOWED_USERS` and trusted identity headers/signatures (fails closed if unconfigured or unauthorized).
 - **Endpoint Protection**: Protects `/sse` and `/message` endpoints, requiring a valid `Bearer` token for all client requests.
 
 ---
@@ -40,15 +41,41 @@ Update your `wrangler.jsonc` file with the generated namespace ID:
 ]
 ```
 
-### 2. Set Secret: `GEMINI_API_KEY`
+### 2. Configure Durable Objects
 
-Store your Google Gemini API key securely in Cloudflare Workers using Wrangler secrets:
+The server uses a Durable Object named `McpSessionDO` to manage active SSE transport streams and message handling across Worker instances. In `wrangler.jsonc`:
+
+```jsonc
+"durable_objects": {
+  "bindings": [
+    {
+      "name": "MCP_SESSION",
+      "class_name": "McpSessionDO"
+    }
+  ]
+},
+"migrations": [
+  {
+    "tag": "v1",
+    "new_classes": ["McpSessionDO"]
+  }
+]
+```
+
+### 3. Configure Allowed Users & Identity Policy
+
+Authorization requests to `/oauth/authorize` fail closed unless an explicit allowed-user policy is configured:
+
+- Set the `ALLOWED_USERS` variable in `wrangler.jsonc` or via secret/env (comma-separated email list, e.g. `"alice@example.com,bob@example.com"`).
+- (Optional) Set `AUTH_SECRET` via `wrangler secret put AUTH_SECRET` to enforce HMAC-SHA256 signature verification on `X-Auth-Signature` when receiving user assertions via `X-Auth-User` or `Cf-Access-Authenticated-User-Email`.
+
+### 4. Set Secret: `GEMINI_API_KEY`
+
+Store your Google Gemini API key securely using Wrangler secrets:
 
 ```bash
 wrangler secret put GEMINI_API_KEY
 ```
-
-When prompted, paste your Gemini API key.
 
 ---
 

@@ -10,7 +10,22 @@
       "id": "OAUTH_KV"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_SESSION",
+        "class_name": "McpSessionDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["McpSessionDO"]
+    }
+  ],
   "vars": {
-    "MCP_RESOURCE": "https://antigravity-mcp-server.workers.dev/mcp"
+    "MCP_RESOURCE": "https://antigravity-mcp-server.workers.dev/mcp",
+    "ALLOWED_USERS": "user@example.com"
   }
 }
