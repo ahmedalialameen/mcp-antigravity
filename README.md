@@ -1,14 +1,15 @@
 # Cloudflare Workers MCP Server for Google Antigravity Agent
 
-A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It bridges Claude (Claude Desktop, Claude Code, and Claude Web) to Google's Antigravity Agent runtime (code sandbox, file manipulation, and autonomous reasoning) over Streamable HTTP/SSE, secured via OAuth 2.1 with PKCE backed by Cloudflare KV and Cloudflare Durable Objects.
+A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It bridges Claude (Claude Desktop, Claude Code, and Claude Web) to Google's Antigravity Agent runtime (code sandbox, file manipulation, and autonomous reasoning) over stateless HTTP (`/mcp`) and legacy SSE (`/sse` + `/message`), secured via OAuth 2.1 with PKCE backed by Cloudflare KV and Cloudflare Durable Objects.
 
 ## Features
 
-- **Google Antigravity Integration**: Connects to `https://generativelanguage.googleapis.com/v1beta/models/antigravity:generateContent` using the official `x-goog-api-key: <GEMINI_API_KEY>` header.
-- **MCP Server & Tool**: Implements the `run_antigravity_agent` tool via `@modelcontextprotocol/sdk` to execute multi-step tasks and file manipulation within the sandbox workspace.
-- **Durable Object Session Management**: Manages MCP SSE connections and message dispatching via `McpSessionDO` Durable Objects, enabling session stickiness and routing across distributed Worker instances, while safely cleaning up resources on client disconnect.
-- **Secure OAuth 2.1 with Configurable User Policy**: Implements OAuth 2.1 routes (`/oauth/authorize`, `/oauth/token`, `/oauth/register`, `/.well-known/oauth-authorization-server`) backed by Cloudflare KV (`OAUTH_KV`). Enforces configurable user authorization via `ALLOWED_USERS` and trusted identity headers/signatures (fails closed if unconfigured or unauthorized).
-- **Endpoint Protection**: Protects `/sse` and `/message` endpoints, requiring a valid `Bearer` token for all client requests.
+- **Google Antigravity Integration**: Connects to Google's Interactions API endpoint `https://generativelanguage.googleapis.com/v1beta/interactions` using the supported agent identifier `antigravity-preview-09-2026` and official `x-goog-api-key: <GEMINI_API_KEY>` header.
+- **MCP Server & Tool**: Implements the `run_antigravity_agent` tool via official SDK v2 (`@modelcontextprotocol/server`) to execute multi-step tasks and file manipulation within the sandbox workspace.
+- **Stateless Web-Standard MCP Transport**: Exposes the primary remote MCP endpoint at `/mcp` via `createMcpHandler()`, providing native support for MCP 2026-07-28 and 2025 stateless fallback over POST without requiring transport session state.
+- **Protected Resource Metadata (RFC 9728)**: Exposes discovery at `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-protected-resource`, and supplies `resource_metadata` in 401 `WWW-Authenticate` response headers.
+- **Legacy SSE Compatibility**: Preserves `/sse` and `/message` backed by `McpSessionDO` Durable Objects for legacy SSE clients with session ownership validation.
+- **Secure OAuth 2.1 with Mandatory Identity Verification**: Implements OAuth 2.1 routes (`/oauth/authorize`, `/oauth/token`, `/oauth/register`, `/.well-known/oauth-authorization-server`) backed by Cloudflare KV (`OAUTH_KV`). Enforces mandatory `AUTH_SECRET` HMAC signature verification and `ALLOWED_USERS` policy (fails closed if unconfigured or unauthorized).
 
 ---
 
@@ -41,9 +42,9 @@ Update your `wrangler.jsonc` file with the generated namespace ID:
 ]
 ```
 
-### 2. Configure Durable Objects
+### 2. Configure Durable Objects (Legacy SSE Compatibility)
 
-The server uses a Durable Object named `McpSessionDO` to manage active SSE transport streams and message handling across Worker instances. In `wrangler.jsonc`:
+The server retains a Durable Object named `McpSessionDO` for backwards compatibility with legacy SSE connections. In `wrangler.jsonc`:
 
 ```jsonc
 "durable_objects": {
@@ -64,10 +65,10 @@ The server uses a Durable Object named `McpSessionDO` to manage active SSE trans
 
 ### 3. Configure Allowed Users & Identity Policy
 
-Authorization requests to `/oauth/authorize` fail closed unless an explicit allowed-user policy is configured:
+Authorization requests to `/oauth/authorize` fail closed unless both `AUTH_SECRET` and `ALLOWED_USERS` are configured:
 
 - Set the `ALLOWED_USERS` variable in `wrangler.jsonc` or via secret/env (comma-separated email list, e.g. `"alice@example.com,bob@example.com"`).
-- (Optional) Set `AUTH_SECRET` via `wrangler secret put AUTH_SECRET` to enforce HMAC-SHA256 signature verification on `X-Auth-Signature` when receiving user assertions via `X-Auth-User` or `Cf-Access-Authenticated-User-Email`.
+- Configure `AUTH_SECRET` via `wrangler secret put AUTH_SECRET`. This secret is **mandatory** and enforces HMAC-SHA256 signature verification on `X-Auth-Signature` when receiving user assertions via `X-Auth-User` or `Cf-Access-Authenticated-User-Email`.
 
 ### 4. Set Secret: `GEMINI_API_KEY`
 
@@ -125,12 +126,28 @@ npm run deploy
 
 ## Claude Desktop Configuration
 
-Configure Claude Desktop to connect to your remote MCP server via `mcp-remote`. Add the server configuration to `claude_desktop_config.json`:
+Configure Claude Desktop to connect to your remote MCP server via `mcp-remote` using the primary stateless `/mcp` endpoint:
 
 ```json
 {
   "mcpServers": {
     "antigravity": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://antigravity-mcp-server.<your-subdomain>.workers.dev/mcp"
+      ]
+    }
+  }
+}
+```
+
+For legacy clients that require SSE:
+```json
+{
+  "mcpServers": {
+    "antigravity-legacy": {
       "command": "npx",
       "args": [
         "-y",

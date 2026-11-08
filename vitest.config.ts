@@ -12,7 +12,7 @@ export default defineWorkersConfig({
       optimizer: {
         ssr: {
           enabled: true,
-          include: ["statuses", "raw-body", "http-errors"]
+          include: ["@modelcontextprotocol/server", "@modelcontextprotocol/core"]
         }
       }
     }

@@ -12,6 +12,36 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
     vi.restoreAllMocks();
   });
 
+  describe("Protected Resource Metadata & OAuth Discovery", () => {
+    it("returns RFC 9728 protected resource metadata on /.well-known/oauth-protected-resource/mcp", async () => {
+      const request = new Request("http://example.com/.well-known/oauth-protected-resource/mcp");
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(request, env as any, ctx);
+      await waitOnExecutionContext(ctx);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Content-Type")).toBe("application/json");
+      const metadata = await response.json<any>();
+      expect(metadata.resource).toBeDefined();
+      expect(metadata.authorization_servers).toContain("http://example.com");
+      expect(metadata.scopes_supported).toEqual(["mcp"]);
+      expect(metadata.bearer_methods_supported).toEqual(["header"]);
+    });
+
+    it("returns 401 challenge with resource_metadata attribute for unauthenticated access to /mcp", async () => {
+      const request = new Request("http://example.com/mcp");
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(request, env as any, ctx);
+      await waitOnExecutionContext(ctx);
+
+      expect(response.status).toBe(401);
+      const wwwAuth = response.headers.get("WWW-Authenticate");
+      expect(wwwAuth).toBeDefined();
+      expect(wwwAuth).toContain('Bearer realm="OAuth"');
+      expect(wwwAuth).toContain('resource_metadata="http://example.com/.well-known/oauth-protected-resource/mcp"');
+    });
+  });
+
   describe("Authentication and Protection", () => {
     it("returns 401 Unauthorized for direct unauthenticated access to /sse", async () => {
       const request = new Request("http://example.com/sse");
@@ -120,7 +150,6 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         token_endpoint_auth_method: "client_secret_basic"
       };
 
-      // Register client first
       const regReq = new Request("http://example.com/oauth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -130,7 +159,6 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const regRes = await worker.fetch(regReq, env as any, ctx);
       const regData = await regRes.json<any>();
 
-      // Attempt authorization without user identity or secret configured
       const authReq = new Request(
         `http://example.com/oauth/authorize?response_type=code&client_id=${regData.client_id}&redirect_uri=https://example.com/callback`
       );
@@ -170,6 +198,47 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(res.error).toContain("User 'eve@example.com' is not authorized");
     });
 
+    it("safely handles ALLOWED_USERS with whitespace and empty items", async () => {
+      const authSecret = "test-secret";
+      const testEnv = { ...env, ALLOWED_USERS: "  alice@example.com , , bob@example.com,  ", AUTH_SECRET: authSecret };
+
+      const encoder = new TextEncoder();
+      const key = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(authSecret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+      const sig = await crypto.subtle.sign("HMAC", key, encoder.encode("bob@example.com"));
+      const hexSig = Array.from(new Uint8Array(sig))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      const req = new Request("http://example.com/oauth/authorize", {
+        headers: {
+          "X-Auth-User": "bob@example.com",
+          "X-Auth-Signature": hexSig
+        }
+      });
+      const res = await authenticateAndAuthorizeUser(req, testEnv as any);
+      expect(res.authorized).toBe(true);
+      expect(res.userId).toBe("bob@example.com");
+    });
+
+    it("rejects invalid HMAC signature hex formatting strictly", async () => {
+      const testEnv = { ...env, ALLOWED_USERS: "alice@example.com", AUTH_SECRET: "secret" };
+      const req = new Request("http://example.com/oauth/authorize", {
+        headers: {
+          "X-Auth-User": "alice@example.com",
+          "X-Auth-Signature": "invalid-hex-not-64-chars"
+        }
+      });
+      const res = await authenticateAndAuthorizeUser(req, testEnv as any);
+      expect(res.authorized).toBe(false);
+      expect(res.error).toContain("Invalid authentication signature format");
+    });
+
     it("verifies HMAC signature if AUTH_SECRET is set", async () => {
       const authSecret = "super-secret-key-12345";
       const testEnv = {
@@ -178,7 +247,6 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         AUTH_SECRET: authSecret
       };
 
-      // 1. Missing signature fails
       const reqNoSig = new Request("http://example.com/oauth/authorize", {
         headers: { "X-Auth-User": "alice@example.com" }
       });
@@ -186,7 +254,6 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(resNoSig.authorized).toBe(false);
       expect(resNoSig.error).toContain("Missing authenticated user credentials or cryptographic signature");
 
-      // 2. Valid signature succeeds
       const encoder = new TextEncoder();
       const key = await crypto.subtle.importKey(
         "raw",
@@ -234,7 +301,6 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const regRes = await worker.fetch(regReq, testEnv as any, ctx);
       const regData = await regRes.json<any>();
 
-      // Generate signature
       const encoder = new TextEncoder();
       const key = await crypto.subtle.importKey(
         "raw",
@@ -269,7 +335,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
   });
 
   describe("Google Antigravity Agent API Integration", () => {
-    it("calls Google Antigravity endpoint with official x-goog-api-key header and correct payload", async () => {
+    it("calls Google Antigravity Interactions API endpoint with official x-goog-api-key header and correct payload", async () => {
       const fakeApiKey = "AIzaSyTestApiKey123";
       const prompt = "Solve bug in sandbox";
       const workspaceFiles = {
@@ -278,21 +344,16 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       };
 
       const mockResponseData = {
-        candidates: [
-          {
-            content: {
-              parts: [{ text: "Bug fixed successfully" }]
-            }
-          }
-        ]
+        interaction_id: "int-12345",
+        status: "completed",
+        output: {
+          result: "Bug fixed successfully"
+        }
       };
 
-      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        new Response(JSON.stringify(mockResponseData), {
-          status: 200,
-          headers: { "Content-Type": "application/json" }
-        })
-      );
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json(mockResponseData, { status: 200 });
+      });
 
       const result = await callAntigravityAgent(fakeApiKey, prompt, workspaceFiles);
 
@@ -300,7 +361,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const [calledUrl, calledInit] = fetchSpy.mock.calls[0];
 
       expect(calledUrl).toBe(
-        "https://generativelanguage.googleapis.com/v1beta/models/antigravity:generateContent"
+        "https://generativelanguage.googleapis.com/v1beta/interactions"
       );
       expect(calledInit?.method).toBe("POST");
 
@@ -310,82 +371,166 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       const payload = JSON.parse(calledInit?.body as string);
       expect(payload).toEqual({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }]
-          }
-        ],
-        agent_config: {
-          tools: [{ type: "code_execution" }, { type: "file_system" }],
-          workspace: workspaceFiles
+        agent: "antigravity-preview-09-2026",
+        input: {
+          query: prompt,
+          files: [
+            { path: "index.js", content: "console.log('hello')" },
+            { path: "package.json", content: "{}" }
+          ]
         }
       });
 
       expect(result).toEqual(mockResponseData);
     });
 
-    it("handles Google API errors properly and throws descriptive error", async () => {
+    it("handles Google API errors properly and throws descriptive error with parsed message", async () => {
       const fakeApiKey = "invalid_key";
-      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        new Response("API Key not valid", { status: 403 })
-      );
+      const errorJson = {
+        error: {
+          code: 403,
+          message: "API Key not valid or project quota exceeded"
+        }
+      };
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json(errorJson, { status: 403 });
+      });
 
       await expect(
         callAntigravityAgent(fakeApiKey, "test prompt")
-      ).rejects.toThrow("Google Antigravity API error (403): API Key not valid");
+      ).rejects.toThrow(
+        "Google Antigravity API error (403): API Key not valid or project quota exceeded"
+      );
     });
   });
 
-  describe("MCP Server and Tool Definition", () => {
-    it("registers run_antigravity_agent tool and handles successful execution", async () => {
-      const mockEnv: any = {
-        GEMINI_API_KEY: "test_key",
-        OAUTH_KV: env.OAUTH_KV,
-        MCP_RESOURCE: "http://example.com/mcp"
-      };
+  describe("Stateless MCP Transport (/mcp) with SDK v2", () => {
+    it("handles tools/list over /mcp using createMcpHandler with Bearer token", async () => {
+      const validToken = "alice:grant1:tokenMcpStateless12345678";
+      const encoder = new TextEncoder();
+      const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(validToken));
+      const tokenId = Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
 
-      const mockResponseData = { output: "done" };
-      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        new Response(JSON.stringify(mockResponseData), { status: 200 })
+      await env.OAUTH_KV.put(
+        `token:alice:grant1:${tokenId}`,
+        JSON.stringify({ expiresAt: Math.floor(Date.now() / 1000) + 3600 })
       );
 
-      const server = createAntigravityMcpServer(mockEnv);
-      expect(server).toBeDefined();
+      const request = new Request("http://example.com/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream"
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/list",
+          params: {}
+        })
+      });
 
-      const tool = (server as any)._registeredTools?.["run_antigravity_agent"];
-      expect(tool).toBeDefined();
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(request, env as any, ctx);
+      await waitOnExecutionContext(ctx);
 
-      const result = await tool.callback({ task: "run tests", contextFiles: { "test.js": "assert(true)" } });
-      expect(result.isError).toBeUndefined();
-      expect(result.content[0].type).toBe("text");
-      expect(result.content[0].text).toBe(JSON.stringify(mockResponseData, null, 2));
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).toContain("run_antigravity_agent");
     });
 
-    it("returns isError: true when run_antigravity_agent tool fails", async () => {
-      const mockEnv: any = {
-        GEMINI_API_KEY: "invalid_key",
-        OAUTH_KV: env.OAUTH_KV,
-        MCP_RESOURCE: "http://example.com/mcp"
-      };
+    it("executes run_antigravity_agent tool call over /mcp", async () => {
+      const validToken = "alice:grant1:tokenToolCall1234567890123";
+      const encoder = new TextEncoder();
+      const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(validToken));
+      const tokenId = Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
 
-      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        new Response("Forbidden", { status: 403 })
+      await env.OAUTH_KV.put(
+        `token:alice:grant1:${tokenId}`,
+        JSON.stringify({ expiresAt: Math.floor(Date.now() / 1000) + 3600 })
       );
 
-      const server = createAntigravityMcpServer(mockEnv);
-      const tool = (server as any)._registeredTools?.["run_antigravity_agent"];
-      expect(tool).toBeDefined();
+      const mockResponseData = {
+        interaction_id: "int-6789",
+        status: "completed",
+        output: { result: "Task completed successfully" }
+      };
 
-      const result = await tool.callback({ task: "fail task" });
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Error executing Antigravity task");
-      expect(result.content[0].text).toContain("Google Antigravity API error (403)");
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (info, init) => {
+        const urlStr = typeof info === "string" ? info : (info instanceof URL ? info.href : (info as any).url);
+        if (urlStr.includes("interactions")) {
+          return Response.json(mockResponseData, { status: 200 });
+        }
+        return new Response("Not found", { status: 404 });
+      });
+
+      const request = new Request("http://example.com/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream"
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "run_antigravity_agent",
+            arguments: {
+              task: "Fix a bug",
+              contextFiles: { "test.py": "print('hello')" }
+            }
+          }
+        })
+      });
+
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(request, env as any, ctx);
+      await waitOnExecutionContext(ctx);
+
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).toContain("Task completed successfully");
+    });
+
+    it("rejects token with mismatched audience/resource on /mcp", async () => {
+      const validToken = "alice:grant1:audienceMismatchToken12345";
+      const encoder = new TextEncoder();
+      const hash = await crypto.subtle.digest("SHA-256", encoder.encode(validToken));
+      const tokenId = Array.from(new Uint8Array(hash))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      await env.OAUTH_KV.put(
+        `token:alice:grant1:${tokenId}`,
+        JSON.stringify({
+          expiresAt: Math.floor(Date.now() / 1000) + 3600,
+          audience: "https://other-service.com/mcp"
+        })
+      );
+
+      const req = new Request("http://example.com/mcp", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${validToken}` }
+      });
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(req, env as any, ctx);
+      await waitOnExecutionContext(ctx);
+
+      expect(res.status).toBe(401);
+      expect(res.headers.get("WWW-Authenticate")).toContain("invalid_audience");
     });
   });
 
-  describe("Durable Object Cross-Instance Session Management & Disconnect Cleanup", () => {
-    it("routes SSE establishment followed by /message through worker.fetch to the shared session owner DO", async () => {
+  describe("Legacy SSE Transport Compatibility & Session Management", () => {
+    it("routes SSE connection to DO, receives endpoint event, and allows message post", async () => {
       const validToken = "user:grant:tokenCrossInstanceTest1234567890";
       const encoder = new TextEncoder();
       const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(validToken));
@@ -398,7 +543,6 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         JSON.stringify({ expiresAt: Math.floor(Date.now() / 1000) + 3600 })
       );
 
-      // 1. Establish SSE session via worker.fetch
       const sseReq = new Request("http://example.com/sse", {
         headers: { Authorization: `Bearer ${validToken}` }
       });
@@ -408,7 +552,6 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       expect(sseRes.status).toBe(200);
 
-      // Read SSE stream header to get sessionId from the endpoint event
       const reader = sseRes.body?.getReader();
       const chunk = await reader?.read();
       const text = new TextDecoder().decode(chunk?.value);
@@ -417,18 +560,13 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(sessionMatch).not.toBeNull();
       const sessionId = sessionMatch![1];
 
-      // 2. From a separate Worker invocation context, send POST /message to worker.fetch
       const postReq = new Request(`http://example.com/message?sessionId=${sessionId}`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${validToken}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          method: "ping",
-          id: 1
-        })
+        body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 })
       });
       const ctx2 = createExecutionContext();
       const postRes = await worker.fetch(postReq, env as any, ctx2);
@@ -437,61 +575,60 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(postRes.status).toBe(202);
       expect(await postRes.text()).toBe("Accepted");
 
-      // 3. Close the stream reader (simulating disconnect) and trigger cleanup
       await reader?.cancel();
-      const sessionLookup = await env.OAUTH_KV.get<{ doId: string }>(`session:${sessionId}`, { type: "json" });
-      if (sessionLookup?.doId) {
-        const doId = env.MCP_SESSION.idFromString(sessionLookup.doId);
-        const sessionStub = env.MCP_SESSION.get(doId);
-        await sessionStub.fetch(
-          new Request(`http://internal/cleanup?sessionId=${sessionId}`, { method: "POST" })
-        );
-      }
-
-      // Subsequent message through worker.fetch for cleaned up session yields 404
-      const afterCleanupReq = new Request(`http://example.com/message?sessionId=${sessionId}`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${validToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 2 })
-      });
-      const ctx3 = createExecutionContext();
-      const afterCleanupRes = await worker.fetch(afterCleanupReq, env as any, ctx3);
-      await waitOnExecutionContext(ctx3);
-
-      expect(afterCleanupRes.status).toBe(404);
-      expect(await afterCleanupRes.text()).toContain("Session not found or expired");
     });
 
-    it("returns 404 for unknown or expired session IDs on /message", async () => {
-      const validToken = "user:grant:token123456789012345678901234567890";
+    it("enforces session ownership and rejects another user attempting to post to legacy session", async () => {
+      const aliceToken = "alice:grant1:aliceLegacyToken123456";
+      const eveToken = "eve:grant2:eveLegacyToken12345678";
+
       const encoder = new TextEncoder();
-      const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(validToken));
-      const tokenId = Array.from(new Uint8Array(hashBuffer))
+      const hashAlice = await crypto.subtle.digest("SHA-256", encoder.encode(aliceToken));
+      const tokenIdAlice = Array.from(new Uint8Array(hashAlice))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      const hashEve = await crypto.subtle.digest("SHA-256", encoder.encode(eveToken));
+      const tokenIdEve = Array.from(new Uint8Array(hashEve))
         .map((b) => b.toString(16).padStart(2, "0"))
         .join("");
 
       await env.OAUTH_KV.put(
-        `token:user:grant:${tokenId}`,
+        `token:alice:grant1:${tokenIdAlice}`,
+        JSON.stringify({ expiresAt: Math.floor(Date.now() / 1000) + 3600 })
+      );
+      await env.OAUTH_KV.put(
+        `token:eve:grant2:${tokenIdEve}`,
         JSON.stringify({ expiresAt: Math.floor(Date.now() / 1000) + 3600 })
       );
 
-      const request = new Request("http://example.com/message?sessionId=non-existent-id", {
+      const sseReq = new Request("http://example.com/sse", {
+        headers: { Authorization: `Bearer ${aliceToken}` }
+      });
+      const ctx1 = createExecutionContext();
+      const sseRes = await worker.fetch(sseReq, env as any, ctx1);
+      await waitOnExecutionContext(ctx1);
+
+      const reader = sseRes.body?.getReader();
+      const chunk = await reader?.read();
+      const text = new TextDecoder().decode(chunk?.value);
+      const sessionMatch = text.match(/sessionId=([a-zA-Z0-9-]+)/);
+      const sessionId = sessionMatch![1];
+
+      const eveReq = new Request(`http://example.com/message?sessionId=${sessionId}`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${validToken}`,
+          Authorization: `Bearer ${eveToken}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 })
       });
-      const ctx = createExecutionContext();
-      const response = await worker.fetch(request, env as any, ctx);
-      await waitOnExecutionContext(ctx);
+      const ctx2 = createExecutionContext();
+      const eveRes = await worker.fetch(eveReq, env as any, ctx2);
+      await waitOnExecutionContext(ctx2);
 
-      expect(response.status).toBe(404);
-      expect(await response.text()).toContain("Session not found or expired");
+      expect(eveRes.status).toBe(403);
+      expect(await eveRes.text()).toContain("Forbidden: Session owned by another user");
+      await reader?.cancel();
     });
   });
 

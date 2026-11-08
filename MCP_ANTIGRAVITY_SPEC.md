@@ -3,23 +3,23 @@
 ## 1. System Overview
 This specification details a remote Model Context Protocol (MCP) server running on Cloudflare Workers. It exposes Google's Antigravity Agent runtime (code sandbox, file manipulation, and autonomous reasoning) to Claude clients (Claude Desktop, Claude Code, and Claude Web).
 
-The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes MCP transport over Server-Sent Events (SSE) and HTTP POST.
+The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes MCP transport over stateless HTTP (`/mcp`) using official SDK v2 (`@modelcontextprotocol/server`), with legacy SSE (`/sse` + `/message`) supported for backwards compatibility.
 
 ```
-┌────────────────┐     Streamable HTTP / SSE       ┌───────────────────────────┐
-│                │ ──────────────────────────────> │   Cloudflare Worker       │
-│  Claude Client │ <────────────────────────────── │ (OAuth Resource Server)   │
-│ (Desktop/Code) │   OAuth 2.1 PKCE Authorization  │                           │
-└────────────────┘ <.............................> │  - OAuth Provider (KV)    │
-                                                   │  - MCP Server & Tools     │
-                                                   └─────────────┬─────────────┘
-                                                                 │ x-goog-api-key:
-                                                                 │ $GEMINI_API_KEY
-                                                                 ▼
-                                                   ┌───────────────────────────┐
-                                                   │ Google Antigravity Agent  │
-                                                   │   (Cloud Linux Sandbox)   │
-                                                   └───────────────────────────┘
+┌────────────────┐            HTTP POST (/mcp)             ┌───────────────────────────┐
+│                │ ──────────────────────────────────────> │   Cloudflare Worker       │
+│  Claude Client │ <────────────────────────────────────── │ (OAuth Resource Server)   │
+│ (Desktop/Code) │   OAuth 2.1 PKCE Authorization          │                           │
+└────────────────┘ <.....................................> │  - OAuth Provider (KV)    │
+                                                           │  - MCP Server & Tools     │
+                                                           └─────────────┬─────────────┘
+                                                                         │ x-goog-api-key:
+                                                                         │ $GEMINI_API_KEY
+                                                                         ▼
+                                                           ┌───────────────────────────┐
+                                                           │ Google Antigravity Agent  │
+                                                           │ (Interactions API Sandbox)│
+                                                           └───────────────────────────┘
 ```
 
 ---
@@ -39,14 +39,15 @@ The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^0.1.0",
-    "@modelcontextprotocol/sdk": "^1.6.0",
+    "@modelcontextprotocol/core": "^2.4.0",
+    "@modelcontextprotocol/server": "^2.4.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.7.0",
     "@cloudflare/workers-types": "^4.20250214.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0",
+    "vitest": "^3.0.9",
     "wrangler": "^3.109.0"
   }
 }
@@ -66,8 +67,23 @@ The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes
       "id": "<YOUR_KV_NAMESPACE_ID>"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_SESSION",
+        "class_name": "McpSessionDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["McpSessionDO"]
+    }
+  ],
   "vars": {
-    "MCP_RESOURCE": "https://antigravity-mcp-server.<your-subdomain>.workers.dev/mcp"
+    "MCP_RESOURCE": "https://antigravity-mcp-server.<your-subdomain>.workers.dev/mcp",
+    "ALLOWED_USERS": "user@example.com"
   }
 }
 ```
@@ -76,154 +92,19 @@ The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes
 Secrets must be stored using Wrangler secrets:
 ```bash
 npx wrangler secret put GEMINI_API_KEY
+npx wrangler secret put AUTH_SECRET
 ```
 
 ---
 
-## 3. Worker Implementation (`src/index.ts`)
+## 3. Worker Implementation Summary
 
-```typescript
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
-import { z } from "zod";
-
-export interface Env {
-  OAUTH_KV: KVNamespace;
-  GEMINI_API_KEY: string;
-  MCP_RESOURCE: string;
-}
-
-/**
- * Dispatches autonomous tasks to Google's Antigravity Agent endpoint.
- * Authenticates via the official Google 'x-goog-api-key' header.
- */
-async function callAntigravityAgent(
-  apiKey: string,
-  prompt: string,
-  workspaceFiles?: Record<string, string>
-) {
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/antigravity:generateContent";
-
-  const payload = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }]
-      }
-    ],
-    agent_config: {
-      tools: [{ type: "code_execution" }, { type: "file_system" }],
-      workspace: workspaceFiles || {}
-    }
-  };
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Google Antigravity API error (${response.status}): ${errorBody}`);
-  }
-
-  return await response.json();
-}
-
-/**
- * Instantiates the MCP Server and registers Antigravity tools.
- */
-export function createAntigravityMcpServer(env: Env) {
-  const server = new McpServer({
-    name: "Antigravity Agent Server",
-    version: "1.0.0"
-  });
-
-  server.tool(
-    "run_antigravity_agent",
-    "Executes autonomous multi-step reasoning, test suites, or file transformations inside Google's Antigravity sandbox.",
-    {
-      task: z.string().describe("Instructions describing the software task, bug fix, or analysis required."),
-      contextFiles: z
-        .record(z.string())
-        .optional()
-        .describe("Key-value mapping of file paths to raw contents to initialize into the sandbox workspace.")
-    },
-    async ({ task, contextFiles }) => {
-      try {
-        const result = await callAntigravityAgent(env.GEMINI_API_KEY, task, contextFiles);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
-      } catch (err: any) {
-        return {
-          content: [{ type: "text", text: `Error executing Antigravity task: ${err.message}` }],
-          isError: true
-        };
-      }
-    }
-  );
-
-  return server;
-}
-
-// In-memory mapping of active SSE transport streams
-const transports = new Map<string, SSEServerTransport>();
-
-// Initialize OAuth 2.1 Provider
-const oauth = new OAuthProvider({
-  apiRoute: "/mcp",
-  authorizeRoute: "/oauth/authorize",
-  tokenRoute: "/oauth/token",
-  clientRegistrationRoute: "/oauth/register"
-});
-
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-
-    // 1. Establish SSE Transport Connection for Claude
-    if (url.pathname === "/sse") {
-      const authHeader = request.headers.get("Authorization");
-      if (!authHeader?.startsWith("Bearer ")) {
-        return new Response("Unauthorized", { status: 401 });
-      }
-
-      const transport = new SSEServerTransport("/message", new Response());
-      const server = createAntigravityMcpServer(env);
-      await server.connect(transport);
-
-      const sessionId = crypto.randomUUID();
-      transports.set(sessionId, transport);
-
-      return transport.handleRequest(request);
-    }
-
-    // 2. Client-to-Server Message Dispatcher
-    if (url.pathname === "/message" && request.method === "POST") {
-      const sessionId = url.searchParams.get("sessionId");
-      const transport = sessionId ? transports.get(sessionId) : null;
-      if (!transport) {
-        return new Response("Session not found or expired", { status: 404 });
-      }
-      return transport.handlePostMessage(request);
-    }
-
-    // 3. Delegate to OAuth Provider
-    return oauth.fetch(request, env, ctx);
-  }
-};
-```
+The server implements:
+1. `callAntigravityAgent`: Uses Google's Interactions API endpoint `https://generativelanguage.googleapis.com/v1beta/interactions` with agent `antigravity-preview-09-2026`.
+2. `createAntigravityMcpServer`: Registers `run_antigravity_agent` tool via `@modelcontextprotocol/server`.
+3. `createMcpHandler`: Serves stateless MCP 2026-07-28 and 2025 fallback requests on `/mcp`.
+4. RFC 9728 Discovery: Serves Protected Resource Metadata at `/.well-known/oauth-protected-resource/mcp` and challenges via `WWW-Authenticate`.
+5. `McpSessionDO`: Manages legacy SSE sessions on `/sse` and `/message` with authenticated user ownership.
 
 ---
 
@@ -239,10 +120,9 @@ Add to `claude_desktop_config.json`:
       "args": [
         "-y",
         "mcp-remote",
-        "https://antigravity-mcp-server.<your-subdomain>.workers.dev/sse"
+        "https://antigravity-mcp-server.<your-subdomain>.workers.dev/mcp"
       ]
     }
   }
 }
-```
 ```
