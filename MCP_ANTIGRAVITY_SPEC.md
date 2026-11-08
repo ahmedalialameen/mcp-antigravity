@@ -3,7 +3,7 @@
 ## 1. System Overview
 This specification details a remote Model Context Protocol (MCP) server running on Cloudflare Workers. It exposes Google's Antigravity Agent runtime (code sandbox, file manipulation, and autonomous reasoning) to Claude clients (Claude Desktop, Claude Code, and Claude Web).
 
-The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes MCP transport over stateless HTTP (`/mcp`) using official SDK v2 (`@modelcontextprotocol/server`), with legacy SSE (`/sse` + `/message`) supported for backwards compatibility.
+The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes MCP transport over stateless HTTP (`/mcp`) using official SDK v2 (`@modelcontextprotocol/server`).
 
 ```
 ┌────────────────┐            HTTP POST (/mcp)             ┌───────────────────────────┐
@@ -41,7 +41,7 @@ The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes
     "@cloudflare/workers-oauth-provider": "^0.1.0",
     "@modelcontextprotocol/core": "^2.4.0",
     "@modelcontextprotocol/server": "^2.4.0",
-    "zod": "^3.23.8"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.7.0",
@@ -67,20 +67,6 @@ The server enforces OAuth 2.1 authentication backed by Cloudflare KV and exposes
       "id": "<YOUR_KV_NAMESPACE_ID>"
     }
   ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "MCP_SESSION",
-        "class_name": "McpSessionDO"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_classes": ["McpSessionDO"]
-    }
-  ],
   "vars": {
     "MCP_RESOURCE": "https://antigravity-mcp-server.<your-subdomain>.workers.dev/mcp",
     "ALLOWED_USERS": "user@example.com"
@@ -104,7 +90,7 @@ The server implements:
 2. `createAntigravityMcpServer`: Registers `run_antigravity_agent` tool via `@modelcontextprotocol/server`.
 3. `createMcpHandler`: Serves stateless MCP 2026-07-28 and 2025 fallback requests on `/mcp`.
 4. RFC 9728 Discovery: Serves Protected Resource Metadata at `/.well-known/oauth-protected-resource/mcp` and challenges via `WWW-Authenticate`.
-5. `McpSessionDO`: Manages legacy SSE sessions on `/sse` and `/message` with authenticated user ownership.
+5. Security & Isolation: Enforces Host & Origin validation, dynamic CORS handling, Cloudflare Access JWT validation, and CSRF-protected OAuth consent.
 
 ---
 
