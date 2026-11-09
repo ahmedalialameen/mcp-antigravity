@@ -43,28 +43,41 @@ Update your `wrangler.jsonc` file with the generated namespace ID:
 ]
 ```
 
-### 2. Configure Allowed Users & Identity Policy
+### 2. Configure Variables & Host/Origin Policies
 
-Authorization requests to `/oauth/authorize` fail closed unless an allowed-user policy is configured:
+The server fails closed unless explicit access and identity policies are configured in `wrangler.jsonc` or Worker secrets:
 
-- Set `ALLOWED_USERS` in `wrangler.jsonc` or secrets (comma-separated email list, e.g. `"alice@example.com,bob@example.com"`).
-- Set `MCP_RESOURCE` to your canonical public MCP URL (e.g. `"https://antigravity-mcp-server.<your-subdomain>.workers.dev/mcp"` or custom domain `"https://mcp.example.com/mcp"`).
+- **`MCP_RESOURCE`**: The canonical public MCP resource URL (e.g. `"https://antigravity-mcp-server.<your-subdomain>.workers.dev/mcp"`).
+- **`ALLOWED_USERS`**: Comma-separated list of authorized email addresses or identities (e.g. `"user@example.com,alice@example.com"`).
+- **`ALLOWED_HOSTS`** *(optional)*: Explicit allowlist of allowed Host header values. If not provided, host validation defaults strictly to the host in `MCP_RESOURCE` and the worker origin.
+- **`ALLOWED_ORIGINS`** *(optional)*: Explicit allowlist of allowed browser Origins for CORS (e.g. `"https://claude.ai"`). Arbitrary origins and `Origin: null` are rejected by default.
 
-#### Authentication Method A: Cloudflare Access (Preferred)
-Protect your Worker behind Cloudflare Access. The server validates the cryptographic RS256 signature in the `Cf-Access-Jwt-Assertion` header:
-- Set `CF_ACCESS_TEAM_DOMAIN` (e.g. `"my-team"` which fetches keys from `https://my-team.cloudflareaccess.com/cdn-cgi/access/certs`).
-- Optionally set `CF_ACCESS_AUD` to match your Cloudflare Access Application Audience Tag.
-- The server extracts and cryptographically verifies the authenticated email.
+### 3. Configure Authentication & CSRF Secrets
 
-#### Authentication Method B: HMAC Signing Proxy (Alternative)
-When using a trusted proxy that signs user requests:
-- Set `AUTH_SECRET` via `wrangler secret put AUTH_SECRET`.
-- The proxy must supply `X-Auth-User` and `X-Auth-Signature` (HMAC-SHA256 of the user email using `AUTH_SECRET`).
+Configure required secrets via `wrangler secret put`:
 
-### 3. Set Secret: `GEMINI_API_KEY`
+#### A. Consent CSRF Protection (Required for Interactive Consent)
+Store a high-entropy secret used for cryptographic CSRF tokens on the OAuth consent screen:
+```bash
+wrangler secret put CONSENT_CSRF_SECRET
+```
 
-Store your Google Gemini API key securely using Wrangler secrets:
+#### B. Identity Authentication Method
 
+- **Method 1: Cloudflare Access JWT (Preferred)**
+  Protect your Worker behind Cloudflare Access. The server validates RS256 assertions (`Cf-Access-Jwt-Assertion`) using cached JWKS with fail-closed claim verification:
+  - Set `CF_ACCESS_TEAM_DOMAIN` (e.g. `"my-team"` which resolves JWKS from `https://my-team.cloudflareaccess.com/cdn-cgi/access/certs`).
+  - Set `CF_ACCESS_AUD` to your Cloudflare Access Application Audience Tag. (Fails closed if missing or mismatched).
+
+- **Method 2: HMAC Identity Proxy (Alternative)**
+  When using a trusted proxy signing requests:
+  ```bash
+  wrangler secret put AUTH_SECRET
+  ```
+  The proxy must provide `X-Auth-User` and `X-Auth-Signature` (HMAC-SHA256 of the user email).
+
+#### C. Google Antigravity Agent API Key (Required)
+Store your Google Gemini / Interactions API key:
 ```bash
 wrangler secret put GEMINI_API_KEY
 ```

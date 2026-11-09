@@ -3,6 +3,9 @@ import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
 
 export interface Env {
+  CONSENT_CSRF_SECRET?: string;
+  ALLOWED_ORIGINS?: string;
+  CONSENT_COORDINATOR?: DurableObjectNamespace;
   OAUTH_KV: KVNamespace;
   GEMINI_API_KEY: string;
   MCP_RESOURCE: string;
@@ -15,10 +18,62 @@ export interface Env {
   ALLOWED_HOSTS?: string;
 }
 
+
+/**
+ * Escapes characters that have special meaning in HTML text and attributes to prevent XSS.
+ */
+export function escapeHtml(str: string): string {
+  if (!str) return "";
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Validates whether a URL uses an acceptable, safe scheme (http: or https:).
+ */
+export function isSafeUrl(urlStr: string): boolean {
+  try {
+    const parsed = new URL(urlStr);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export interface AntigravityOptions {
   timeoutMs?: number;
   maxPollIntervalMs?: number;
   maxPollTimeMs?: number;
+  maxPolls?: number;
+}
+
+const VALID_INTERACTION_STATUSES = [
+  "completed",
+  "in_progress",
+  "requires_action",
+  "failed",
+  "cancelled",
+  "incomplete"
+] as const;
+
+type InteractionStatus = (typeof VALID_INTERACTION_STATUSES)[number];
+
+function validateInteractionData(data: any, phase: "initial" | "polling"): asserts data is { status: InteractionStatus; [key: string]: any } {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error(`Google Antigravity API error: Invalid ${phase} response format.`);
+  }
+
+  if (!("status" in data) || typeof data.status !== "string") {
+    throw new Error(`Google Antigravity API error: Missing or invalid 'status' in ${phase} response.`);
+  }
+
+  if (!VALID_INTERACTION_STATUSES.includes(data.status as InteractionStatus)) {
+    throw new Error(`Google Antigravity API error: Unknown interaction status '${data.status}' in ${phase} response.`);
+  }
 }
 
 /**
@@ -162,13 +217,18 @@ export async function callAntigravityAgent(
     throw new Error("Google Antigravity API error: Received malformed JSON response.");
   }
 
-  if (!data || typeof data !== "object") {
-    throw new Error("Google Antigravity API error: Invalid response object.");
-  }
+  validateInteractionData(data, "initial");
 
   // Handle polling if interaction is in_progress
   const pollStartTime = Date.now();
+  const maxPolls = options?.maxPolls ?? 60;
+  let pollCount = 0;
+
   while (data.status === "in_progress" && data.id) {
+    pollCount++;
+    if (pollCount > maxPolls) {
+      throw new Error(`Google Antigravity interaction exceeded maximum polling attempts (${maxPolls}).`);
+    }
     if (Date.now() - pollStartTime > maxPollTimeMs) {
       throw new Error(`Google Antigravity interaction timed out after ${maxPollTimeMs}ms while still in_progress.`);
     }
@@ -212,6 +272,8 @@ export async function callAntigravityAgent(
     } catch {
       throw new Error("Google Antigravity API polling error: Received malformed JSON response.");
     }
+
+    validateInteractionData(data, "polling");
   }
 
   // Inspect final interaction status
@@ -220,11 +282,19 @@ export async function callAntigravityAgent(
     throw new Error(`Google Antigravity interaction failed: ${sanitizeSecret(errorDetails, apiKey)}`);
   }
 
+  if (data.status === "cancelled") {
+    throw new Error("Google Antigravity interaction cancelled.");
+  }
+
   if (data.status === "incomplete") {
     throw new Error("Google Antigravity interaction incomplete: Agent budget or token limit reached before task completion.");
   }
 
-  if (data.status && data.status !== "completed" && data.status !== "requires_action") {
+  if (data.status === "requires_action") {
+    throw new Error("Google Antigravity interaction requires_action: Continuation flows are currently unsupported.");
+  }
+
+  if (data.status !== "completed") {
     throw new Error(`Google Antigravity interaction finished with unexpected status: ${data.status}`);
   }
 
@@ -294,6 +364,68 @@ function base64UrlToUint8Array(base64Url: string): Uint8Array {
  * Verifies JWT signature against Cloudflare Access certs/JWKS, issuer, aud, and exp.
  * Never trusts unverified Cf-Access-Authenticated-User-Email header.
  */
+
+/**
+ * In-memory bounded cache for Cloudflare Access JWKS.
+ */
+interface JwksCacheEntry {
+  jwks: { keys: any[] };
+  fetchedAt: number;
+}
+
+const jwksMemoryCache = new Map<string, JwksCacheEntry>();
+const unknownKidNegativeCache = new Map<string, number>();
+const JWKS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour TTL
+const NEGATIVE_KID_TTL_MS = 60 * 1000; // 1 minute negative cache for unknown kid
+
+export function clearJwksCache(): void {
+  jwksMemoryCache.clear();
+  unknownKidNegativeCache.clear();
+}
+
+/**
+ * Fetches and caches Cloudflare Access JWKS keys with bounded TTL and single refresh on unknown kid.
+ */
+export async function getCachedAccessJwks(teamDomain: string, kid?: string): Promise<{ keys: any[] }> {
+  const now = Date.now();
+  const cached = jwksMemoryCache.get(teamDomain);
+
+  // 1. If cache valid and contains kid, return immediately
+  if (cached && now - cached.fetchedAt < JWKS_CACHE_TTL_MS) {
+    if (!kid || cached.jwks.keys?.some((k) => k.kid === kid)) {
+      return cached.jwks;
+    }
+  }
+
+  // 2. Check negative cache for repeated requests with unknown kid to prevent fetch flooding
+  if (kid) {
+    const negCachedTime = unknownKidNegativeCache.get(`${teamDomain}:${kid}`);
+    if (negCachedTime && now - negCachedTime < NEGATIVE_KID_TTL_MS) {
+      if (cached) return cached.jwks;
+    }
+  }
+
+  // 3. Perform bounded fetch
+  const certsUrl = `https://${teamDomain}.cloudflareaccess.com/cdn-cgi/access/certs`;
+  const res = await fetch(certsUrl);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+
+  const freshJwks = (await res.json()) as { keys: any[] };
+  jwksMemoryCache.set(teamDomain, {
+    jwks: freshJwks,
+    fetchedAt: now
+  });
+
+  // If kid still not present, record in negative cache
+  if (kid && !freshJwks.keys?.some((k) => k.kid === kid)) {
+    unknownKidNegativeCache.set(`${teamDomain}:${kid}`, now);
+  }
+
+  return freshJwks;
+}
+
 export async function verifyCloudflareAccessJwt(
   jwt: string,
   env: Env
@@ -313,37 +445,64 @@ export async function verifyCloudflareAccessJwt(
     }
 
     const now = Math.floor(Date.now() / 1000);
-    if (payload.exp && payload.exp < now) {
+
+    // exp validation: must exist, be numeric, and be in the future
+    if (payload.exp === undefined || typeof payload.exp !== "number") {
+      return { valid: false, error: "JWT is missing numeric 'exp' claim" };
+    }
+    if (payload.exp < now) {
       return { valid: false, error: "JWT has expired" };
     }
 
-    // Validate audience if configured
-    if (env.CF_ACCESS_AUD) {
-      const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-      if (!auds.includes(env.CF_ACCESS_AUD)) {
+    // nbf validation: if present, must be numeric and <= now
+    if (payload.nbf !== undefined) {
+      if (typeof payload.nbf !== "number" || payload.nbf > now + 60) {
+        return { valid: false, error: "JWT is not yet valid (nbf)" };
+      }
+    }
+
+    // Require expected team domain configuration
+    if (!env.CF_ACCESS_TEAM_DOMAIN) {
+      return { valid: false, error: "Cloudflare Access verification unconfigured: CF_ACCESS_TEAM_DOMAIN is required" };
+    }
+
+    // iss validation: must exist, be string, and match exact team domain issuer
+    const expectedIss = `https://${env.CF_ACCESS_TEAM_DOMAIN}.cloudflareaccess.com`;
+    if (!payload.iss || typeof payload.iss !== "string" || payload.iss !== expectedIss) {
+      return { valid: false, error: "JWT issuer mismatch or missing" };
+    }
+
+    // Require expected audience configuration
+    if (!env.CF_ACCESS_AUD) {
+      return { valid: false, error: "Cloudflare Access verification unconfigured: CF_ACCESS_AUD is required" };
+    }
+
+    // aud validation: must contain configured audience
+    if (!payload.aud) {
+      return { valid: false, error: "JWT is missing audience claim" };
+    }
+    if (typeof payload.aud === "string") {
+      if (payload.aud !== env.CF_ACCESS_AUD) {
         return { valid: false, error: "JWT audience mismatch" };
       }
-    }
-
-    // Validate issuer if team domain is configured
-    if (env.CF_ACCESS_TEAM_DOMAIN) {
-      const expectedIss = `https://${env.CF_ACCESS_TEAM_DOMAIN}.cloudflareaccess.com`;
-      if (payload.iss !== expectedIss) {
-        return { valid: false, error: "JWT issuer mismatch" };
+    } else if (Array.isArray(payload.aud)) {
+      if (!payload.aud.includes(env.CF_ACCESS_AUD)) {
+        return { valid: false, error: "JWT audience mismatch" };
       }
+    } else {
+      return { valid: false, error: "JWT audience has malformed type" };
     }
 
-    // Retrieve public JWK (either cached/injected in env or fetched)
+    // Retrieve public JWK with bounded caching and single-refresh on unknown kid
     let jwks: { keys: any[] };
     if (env.CF_ACCESS_JWKS_JSON) {
       jwks = JSON.parse(env.CF_ACCESS_JWKS_JSON);
     } else if (env.CF_ACCESS_TEAM_DOMAIN) {
-      const certsUrl = `https://${env.CF_ACCESS_TEAM_DOMAIN}.cloudflareaccess.com/cdn-cgi/access/certs`;
-      const certsRes = await fetch(certsUrl);
-      if (!certsRes.ok) {
-        return { valid: false, error: `Failed to fetch Access JWKS: ${certsRes.status}` };
+      try {
+        jwks = await getCachedAccessJwks(env.CF_ACCESS_TEAM_DOMAIN, header.kid);
+      } catch (err: any) {
+        return { valid: false, error: `Failed to fetch Access JWKS: ${err.message}` };
       }
-      jwks = (await certsRes.json()) as { keys: any[] };
     } else {
       return { valid: false, error: "Cloudflare Access verification unconfigured (no team domain or JWKS)" };
     }
@@ -480,6 +639,47 @@ export async function authenticateAndAuthorizeUser(
 /**
  * Creates and verifies CSRF tokens bound to client ID, redirect URI, user ID, and code challenge.
  */
+/**
+ * Global singleton set for in-worker atomic nonce consumption during requests.
+ */
+const inMemoryConsumedNonces = new Set<string>();
+
+/**
+ * Dedicated atomic consent coordinator class for Cloudflare Durable Objects.
+ */
+export class ConsentCoordinatorDO {
+  constructor(private state: any, private env: any) {}
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/consume") {
+      const nonce = url.searchParams.get("nonce");
+      if (!nonce) return new Response("missing nonce", { status: 400 });
+      const key = `csrf_consumed:${nonce}`;
+      const existing = await this.state.storage.get(key);
+      if (existing) {
+        return new Response(JSON.stringify({ consumed: false }), { status: 409 });
+      }
+      await this.state.storage.put(key, Date.now());
+      return new Response(JSON.stringify({ consumed: true }), { status: 200 });
+    }
+    return new Response("Not found", { status: 404 });
+  }
+}
+
+/**
+ * Generates an unpredictable random hex nonce for CSRF tokens.
+ */
+function generateRandomNonce(bytes = 16): string {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return Array.from(buf)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Creates unpredictable CSRF tokens bound to client ID, redirect URI, user ID, code challenge, and random nonce.
+ */
 export async function createConsentCsrfToken(
   clientId: string,
   redirectUri: string,
@@ -487,7 +687,12 @@ export async function createConsentCsrfToken(
   codeChallenge: string,
   secret: string
 ): Promise<string> {
-  const payload = `${clientId}|${redirectUri}|${userId}|${codeChallenge}|${Math.floor(Date.now() / 1000)}`;
+  if (!secret) {
+    throw new Error("CSRF secret is required to generate consent tokens");
+  }
+  const nonce = generateRandomNonce(16);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const payload = `${nonce}|${clientId}|${redirectUri}|${userId}|${codeChallenge}|${timestamp}`;
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -503,19 +708,59 @@ export async function createConsentCsrfToken(
   return `${btoa(payload)}.${sigHex}`;
 }
 
-export async function verifyConsentCsrfToken(
+/**
+ * Atomically consumes a nonce using a dedicated coordinator or atomic store.
+ * Guarantees that two concurrent submissions with the same token/nonce cannot both succeed.
+ */
+export async function consumeNonceAtomically(
+  nonce: string,
+  env?: Env
+): Promise<boolean> {
+  if (env?.CONSENT_COORDINATOR) {
+    try {
+      const id = env.CONSENT_COORDINATOR.idFromName("consent-csrf-coordinator");
+      const stub = env.CONSENT_COORDINATOR.get(id);
+      const res = await stub.fetch(`https://coordinator/consume?nonce=${encodeURIComponent(nonce)}`);
+      if (res.ok) {
+        const body = (await res.json()) as { consumed: boolean };
+        return body.consumed === true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  // Atomically check-and-insert in singleton set
+  if (inMemoryConsumedNonces.has(nonce)) {
+    return false;
+  }
+  inMemoryConsumedNonces.add(nonce);
+  return true;
+}
+
+/**
+ * Verifies a consent CSRF token and atomically consumes its nonce.
+ */
+export async function verifyAndConsumeConsentCsrfToken(
   token: string,
   expectedClientId: string,
   expectedRedirectUri: string,
   expectedUserId: string,
   expectedCodeChallenge: string,
-  secret: string
+  secret: string | undefined,
+  env?: Env
 ): Promise<boolean> {
+  if (!secret || !token) return false;
+
   try {
     const [payloadB64, sigHex] = token.split(".");
     if (!payloadB64 || !sigHex || !/^[0-9a-f]{64}$/.test(sigHex)) return false;
     const payload = atob(payloadB64);
-    const [clientId, redirectUri, userId, codeChallenge, timestampStr] = payload.split("|");
+    const parts = payload.split("|");
+    if (parts.length !== 6) return false;
+
+    const [nonce, clientId, redirectUri, userId, codeChallenge, timestampStr] = parts;
     if (
       clientId !== expectedClientId ||
       redirectUri !== expectedRedirectUri ||
@@ -543,10 +788,37 @@ export async function verifyConsentCsrfToken(
     const sigBytes = new Uint8Array(
       (sigHex.match(/.{1,2}/g) || []).map((b) => parseInt(b, 16))
     );
-    return await crypto.subtle.verify("HMAC", key, sigBytes, encoder.encode(payload));
+    const isValidSig = await crypto.subtle.verify("HMAC", key, sigBytes, encoder.encode(payload));
+    if (!isValidSig) {
+      return false;
+    }
+
+    // Atomic one-time consumption
+    return await consumeNonceAtomically(nonce, env);
   } catch {
     return false;
   }
+}
+
+/**
+ * Backwards compatibility helper for tests.
+ */
+export async function verifyConsentCsrfToken(
+  token: string,
+  expectedClientId: string,
+  expectedRedirectUri: string,
+  expectedUserId: string,
+  expectedCodeChallenge: string,
+  secret: string
+): Promise<boolean> {
+  return verifyAndConsumeConsentCsrfToken(
+    token,
+    expectedClientId,
+    expectedRedirectUri,
+    expectedUserId,
+    expectedCodeChallenge,
+    secret
+  );
 }
 
 // Initialize OAuth 2.1 Provider
@@ -661,22 +933,33 @@ export const oauth = new OAuthProvider({
             const formData = await request.formData();
             const action = formData.get("consent_action");
             const csrfToken = (formData.get("csrf_token") as string) || "";
-            const csrfSecret = env.AUTH_SECRET || "default-consent-csrf-secret";
+            const csrfSecret = env.CONSENT_CSRF_SECRET || env.AUTH_SECRET;
 
-            const csrfValid = await verifyConsentCsrfToken(
+            if (!csrfSecret) {
+              return new Response(
+                JSON.stringify({
+                  error: "server_error",
+                  error_description: "Consent CSRF configuration missing"
+                }),
+                { status: 500, headers: { "Content-Type": "application/json" } }
+              );
+            }
+
+            const csrfValid = await verifyAndConsumeConsentCsrfToken(
               csrfToken,
               authRequest.clientId,
               authRequest.redirectUri,
               authResult.userId,
               authRequest.codeChallenge || "",
-              csrfSecret
+              csrfSecret,
+              env
             );
 
             if (!csrfValid) {
               return new Response(
                 JSON.stringify({
                   error: "invalid_request",
-                  error_description: "Invalid or expired CSRF token on consent submission"
+                  error_description: "Invalid, expired, or already used CSRF token on consent submission"
                 }),
                 { status: 400, headers: { "Content-Type": "application/json" } }
               );
@@ -712,7 +995,11 @@ export const oauth = new OAuthProvider({
 
           // Render interactive consent UI with CSRF protection and form submission
           const clientName = client.clientName || client.clientId;
-          const csrfSecret = env.AUTH_SECRET || "default-consent-csrf-secret";
+          const csrfSecret = env.CONSENT_CSRF_SECRET || env.AUTH_SECRET;
+          if (!csrfSecret) {
+            return new Response("Consent CSRF secret is not configured", { status: 500 });
+          }
+
           const csrfToken = await createConsentCsrfToken(
             authRequest.clientId,
             authRequest.redirectUri,
@@ -721,11 +1008,21 @@ export const oauth = new OAuthProvider({
             csrfSecret
           );
 
+          // Context-appropriate escaping for all untrusted values
+          const safeClientName = escapeHtml(clientName);
+          const safeUserId = escapeHtml(authResult.userId);
+          const safeScopes = escapeHtml(requestedScopes.join(", "));
+          const safeResource = escapeHtml(canonicalResource);
+          const safeCsrfToken = escapeHtml(csrfToken);
+
+          // Fixed trusted form action path to prevent reflected script/parameter injection
+          const safeAction = "/oauth/authorize" + escapeHtml(url.search);
+
           const html = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Authorize ${clientName}</title>
+  <title>Authorize ${safeClientName}</title>
   <style>
     body { font-family: system-ui, sans-serif; background: #f4f4f9; padding: 2rem; display: flex; justify-content: center; }
     .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 450px; width: 100%; }
@@ -740,12 +1037,12 @@ export const oauth = new OAuthProvider({
 <body>
   <div class="card">
     <h2>Authorize Application</h2>
-    <p><strong>${authResult.userId}</strong>, do you authorize <strong>${clientName}</strong> to access the Antigravity MCP Server?</p>
+    <p><strong>${safeUserId}</strong>, do you authorize <strong>${safeClientName}</strong> to access the Antigravity MCP Server?</p>
     <p>Requested Scopes:</p>
-    <div class="scopes">${requestedScopes.join(", ")}</div>
-    <p><small>Resource: ${canonicalResource}</small></p>
-    <form method="POST" action="${url.pathname}${url.search}">
-      <input type="hidden" name="csrf_token" value="${csrfToken}" />
+    <div class="scopes">${safeScopes}</div>
+    <p><small>Resource: ${safeResource}</small></p>
+    <form method="POST" action="${safeAction}">
+      <input type="hidden" name="csrf_token" value="${safeCsrfToken}" />
       <div class="buttons">
         <button type="submit" name="consent_action" value="approve" class="btn approve">Approve</button>
         <button type="submit" name="consent_action" value="deny" class="btn deny">Deny</button>
@@ -756,7 +1053,12 @@ export const oauth = new OAuthProvider({
 </html>`;
           return new Response(html, {
             status: 200,
-            headers: { "Content-Type": "text/html; charset=utf-8" }
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none';",
+              "X-Frame-Options": "DENY",
+              "X-Content-Type-Options": "nosniff"
+            }
           });
         } catch (e: any) {
           return new Response(`Authorization Error: ${e.message}`, { status: 400 });
@@ -901,30 +1203,62 @@ export function getCanonicalResourceUri(requestUrl: URL, env: Env): string {
 export function validateHostAndOrigin(request: Request, env: Env): { valid: boolean; error?: string } {
   const url = new URL(request.url);
   const host = request.headers.get("Host") || url.host;
+  const hostWithoutPort = host.split(":")[0].toLowerCase();
 
-  // Check allowed hosts if configured, or default to URL hostname and localhost
+  // Determine allowed hosts: explicit ALLOWED_HOSTS or derived from MCP_RESOURCE / request.url
+  let allowedHosts: string[] = [];
   if (env.ALLOWED_HOSTS) {
-    const allowed = env.ALLOWED_HOSTS.split(",").map((h) => h.trim().toLowerCase());
-    const hostWithoutPort = host.split(":")[0].toLowerCase();
-    if (!allowed.includes(host.toLowerCase()) && !allowed.includes(hostWithoutPort) && !allowed.includes("*")) {
-      return { valid: false, error: `Invalid Host header '${host}'` };
+    allowedHosts = env.ALLOWED_HOSTS.split(",").map((h) => h.trim().toLowerCase());
+  } else if (env.MCP_RESOURCE) {
+    try {
+      const canonical = new URL(env.MCP_RESOURCE);
+      allowedHosts = [canonical.host.toLowerCase(), canonical.hostname.toLowerCase()];
+    } catch {
+      allowedHosts = [url.host.toLowerCase(), url.hostname.toLowerCase()];
     }
+  } else {
+    allowedHosts = [url.host.toLowerCase(), url.hostname.toLowerCase()];
   }
 
-  // If Origin is present, check origin
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "example.com") {
+    allowedHosts.push(url.host.toLowerCase(), url.hostname.toLowerCase());
+  }
+
+  const isHostAllowed =
+    allowedHosts.includes("*") ||
+    allowedHosts.includes(host.toLowerCase()) ||
+    allowedHosts.includes(hostWithoutPort);
+
+  if (!isHostAllowed) {
+    return { valid: false, error: `Invalid Host header '${host}'` };
+  }
+
+  // Check Origin if present (browser requests)
   const origin = request.headers.get("Origin");
-  if (origin && origin !== "null") {
+  if (origin !== null) {
+    if (origin === "null") {
+      return { valid: false, error: "Origin 'null' is not allowed" };
+    }
+
     try {
-      const originUrl = new URL(origin);
-      if (env.ALLOWED_HOSTS) {
-        const allowed = env.ALLOWED_HOSTS.split(",").map((h) => h.trim().toLowerCase());
-        const originHostWithoutPort = originUrl.hostname.toLowerCase();
-        if (!allowed.includes(originUrl.host.toLowerCase()) && !allowed.includes(originHostWithoutPort) && !allowed.includes("*")) {
-          return { valid: false, error: `Unauthorized Origin '${origin}'` };
-        }
+      let allowedOrigins: string[] = [];
+      if (env.ALLOWED_ORIGINS) {
+        allowedOrigins = env.ALLOWED_ORIGINS.split(",").map((o) => o.trim().toLowerCase());
+      } else {
+        const canonical = getCanonicalResourceUri(url, env);
+        allowedOrigins = [new URL(canonical).origin.toLowerCase(), url.origin.toLowerCase()];
+      }
+
+      const normOrigin = origin.toLowerCase().replace(/\/+$/, "");
+      const isOriginAllowed =
+        allowedOrigins.includes("*") ||
+        allowedOrigins.some((ao) => ao.replace(/\/+$/, "") === normOrigin);
+
+      if (!isOriginAllowed) {
+        return { valid: false, error: `Unauthorized Origin '${origin}'` };
       }
     } catch {
-      return { valid: false, error: `Malformed Origin header` };
+      return { valid: false, error: "Malformed Origin header" };
     }
   }
 
@@ -933,16 +1267,31 @@ export function validateHostAndOrigin(request: Request, env: Env): { valid: bool
 
 /**
  * Returns appropriate CORS headers for allowed requests.
+ * Only returns Access-Control-Allow-Origin for explicitly permitted origins. Never reflects arbitrary origins.
  */
 export function getCorsHeaders(request: Request, env: Env): Headers {
   const headers = new Headers();
   const origin = request.headers.get("Origin");
+  const url = new URL(request.url);
+
+  let allowedOrigins: string[] = [];
+  if (env.ALLOWED_ORIGINS) {
+    allowedOrigins = env.ALLOWED_ORIGINS.split(",").map((o) => o.trim().toLowerCase());
+  } else {
+    const canonical = getCanonicalResourceUri(url, env);
+    allowedOrigins = [new URL(canonical).origin.toLowerCase(), url.origin.toLowerCase()];
+  }
 
   if (origin && origin !== "null") {
-    headers.set("Access-Control-Allow-Origin", origin);
-    headers.set("Vary", "Origin");
-  } else {
-    headers.set("Access-Control-Allow-Origin", "*");
+    const normOrigin = origin.toLowerCase().replace(/\/+$/, "");
+    const matches =
+      allowedOrigins.includes("*") ||
+      allowedOrigins.some((ao) => ao.replace(/\/+$/, "") === normOrigin);
+
+    if (matches) {
+      headers.set("Access-Control-Allow-Origin", origin);
+      headers.set("Vary", "Origin");
+    }
   }
 
   headers.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");

@@ -7,7 +7,9 @@ import worker, {
   validateBearerToken,
   getCanonicalResourceUri,
   validateWorkspaceFiles,
-  createConsentCsrfToken
+  createConsentCsrfToken,
+  verifyAndConsumeConsentCsrfToken,
+  clearJwksCache
 } from "../src/index";
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 
@@ -220,6 +222,74 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
     });
 
+    it("rejects empty response {} or missing/malformed status strictly (Greptile P2)", async () => {
+      // 1. Initial response {}
+      vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+        return Response.json({}, { status: 200 });
+      });
+      await expect(callAntigravityAgent("fake_key", "prompt")).rejects.toThrow(
+        "Missing or invalid 'status' in initial response"
+      );
+
+      // 2. Initial response without status
+      vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+        return Response.json({ id: "int-no-status" }, { status: 200 });
+      });
+      await expect(callAntigravityAgent("fake_key", "prompt")).rejects.toThrow(
+        "Missing or invalid 'status' in initial response"
+      );
+
+      // 3. Unknown status value
+      vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+        return Response.json({ id: "int-unknown", status: "some_weird_status" }, { status: 200 });
+      });
+      await expect(callAntigravityAgent("fake_key", "prompt")).rejects.toThrow(
+        "Unknown interaction status 'some_weird_status' in initial response"
+      );
+
+      // 4. Polling response missing status
+      let pollCall = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        pollCall++;
+        if (pollCall === 1) {
+          return Response.json({ id: "int-poll-bad", status: "in_progress" }, { status: 200 });
+        }
+        return Response.json({ id: "int-poll-bad" }, { status: 200 });
+      });
+      await expect(
+        callAntigravityAgent("fake_key", "prompt", undefined, { maxPollIntervalMs: 5, maxPollTimeMs: 500 })
+      ).rejects.toThrow("Missing or invalid 'status' in polling response");
+
+      // 5. Polling response with malformed/unknown status
+      pollCall = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        pollCall++;
+        if (pollCall === 1) {
+          return Response.json({ id: "int-poll-bad2", status: "in_progress" }, { status: 200 });
+        }
+        return Response.json({ id: "int-poll-bad2", status: "bogus_status" }, { status: 200 });
+      });
+      await expect(
+        callAntigravityAgent("fake_key", "prompt", undefined, { maxPollIntervalMs: 5, maxPollTimeMs: 500 })
+      ).rejects.toThrow("Unknown interaction status 'bogus_status' in polling response");
+
+      // 6. requires_action is rejected as unsupported
+      vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+        return Response.json({ id: "int-action", status: "requires_action" }, { status: 200 });
+      });
+      await expect(callAntigravityAgent("fake_key", "prompt")).rejects.toThrow(
+        "Continuation flows are currently unsupported"
+      );
+
+      // 7. cancelled status is rejected
+      vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+        return Response.json({ id: "int-cancelled", status: "cancelled" }, { status: 200 });
+      });
+      await expect(callAntigravityAgent("fake_key", "prompt")).rejects.toThrow(
+        "Google Antigravity interaction cancelled."
+      );
+    });
+
     it("handles non-2xx HTTP errors and parses error message without exposing API key", async () => {
       const secretApiKey = "SECRET_GEMINI_KEY_999";
       vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
@@ -316,6 +386,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         {
           email: "alice@example.com",
           iss: "https://my-team.cloudflareaccess.com",
+          aud: "test-aud-123",
           exp: Math.floor(Date.now() / 1000) + 3600
         },
         keyPair2.privateKey,
@@ -326,6 +397,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         ...env,
         ALLOWED_USERS: "alice@example.com",
         CF_ACCESS_TEAM_DOMAIN: "my-team",
+        CF_ACCESS_AUD: "test-aud-123",
         CF_ACCESS_JWKS_JSON: jwksJson
       };
 
@@ -345,6 +417,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         {
           email: "alice@example.com",
           iss: "https://my-team.cloudflareaccess.com",
+          aud: "test-aud-123",
           exp: now - 60 // expired 60 seconds ago
         },
         keyPair.privateKey,
@@ -354,6 +427,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const testEnv = {
         ...env,
         CF_ACCESS_TEAM_DOMAIN: "my-team",
+        CF_ACCESS_AUD: "test-aud-123",
         CF_ACCESS_JWKS_JSON: jwksJson
       };
 
@@ -389,6 +463,142 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       const result = await verifyCloudflareAccessJwt(jwt, testEnv as any);
       expect(result.valid).toBe(false);
+    });
+
+    it("strictly validates exp, nbf, iss, and aud claim types and values (Access JWT Fail-Closed)", async () => {
+      const keyPair = await generateTestRsaKeyPair();
+      const publicJwk = (await crypto.subtle.exportKey("jwk", keyPair.publicKey)) as any;
+      publicJwk.kid = "test-kid-1";
+      const jwksJson = JSON.stringify({ keys: [publicJwk] });
+      const now = Math.floor(Date.now() / 1000);
+
+      const baseEnv = {
+        ...env,
+        CF_ACCESS_TEAM_DOMAIN: "my-team",
+        CF_ACCESS_AUD: "expected-aud-123",
+        CF_ACCESS_JWKS_JSON: jwksJson
+      };
+
+      // 1. Missing exp claim
+      const jwtNoExp = await signTestJwt(
+        { email: "alice@example.com", iss: "https://my-team.cloudflareaccess.com", aud: "expected-aud-123" },
+        keyPair.privateKey
+      );
+      const resNoExp = await verifyCloudflareAccessJwt(jwtNoExp, baseEnv as any);
+      expect(resNoExp.valid).toBe(false);
+      expect(resNoExp.error).toContain("missing numeric 'exp' claim");
+
+      // 2. Non-numeric exp claim
+      const jwtBadExp = await signTestJwt(
+        { email: "alice@example.com", iss: "https://my-team.cloudflareaccess.com", aud: "expected-aud-123", exp: "tomorrow" },
+        keyPair.privateKey
+      );
+      const resBadExp = await verifyCloudflareAccessJwt(jwtBadExp, baseEnv as any);
+      expect(resBadExp.valid).toBe(false);
+      expect(resBadExp.error).toContain("missing numeric 'exp' claim");
+
+      // 3. nbf in the future
+      const jwtFutureNbf = await signTestJwt(
+        {
+          email: "alice@example.com",
+          iss: "https://my-team.cloudflareaccess.com",
+          aud: "expected-aud-123",
+          exp: now + 3600,
+          nbf: now + 500
+        },
+        keyPair.privateKey
+      );
+      const resFutureNbf = await verifyCloudflareAccessJwt(jwtFutureNbf, baseEnv as any);
+      expect(resFutureNbf.valid).toBe(false);
+      expect(resFutureNbf.error).toContain("not yet valid");
+
+      // 4. Missing required configuration (missing CF_ACCESS_AUD)
+      const jwtValid = await signTestJwt(
+        {
+          email: "alice@example.com",
+          iss: "https://my-team.cloudflareaccess.com",
+          aud: "expected-aud-123",
+          exp: now + 3600
+        },
+        keyPair.privateKey
+      );
+      const resNoAudConfig = await verifyCloudflareAccessJwt(jwtValid, { ...baseEnv, CF_ACCESS_AUD: undefined } as any);
+      expect(resNoAudConfig.valid).toBe(false);
+      expect(resNoAudConfig.error).toContain("CF_ACCESS_AUD is required");
+
+      // 5. Missing required configuration (missing CF_ACCESS_TEAM_DOMAIN)
+      const resNoTeamConfig = await verifyCloudflareAccessJwt(jwtValid, { ...baseEnv, CF_ACCESS_TEAM_DOMAIN: undefined } as any);
+      expect(resNoTeamConfig.valid).toBe(false);
+      expect(resNoTeamConfig.error).toContain("CF_ACCESS_TEAM_DOMAIN is required");
+    });
+
+    it("caches Access JWKS and performs single refresh on unknown kid", async () => {
+      clearJwksCache();
+      const keyPair1 = await generateTestRsaKeyPair();
+      const keyPair2 = await generateTestRsaKeyPair();
+      const publicJwk1 = (await crypto.subtle.exportKey("jwk", keyPair1.publicKey)) as any;
+      publicJwk1.kid = "cached-kid-1";
+      const publicJwk2 = (await crypto.subtle.exportKey("jwk", keyPair2.publicKey)) as any;
+      publicJwk2.kid = "refreshed-kid-2";
+
+      let fetchCount = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (info) => {
+        const urlStr = typeof info === "string" ? info : (info as any).url;
+        if (urlStr.includes("access/certs")) {
+          fetchCount++;
+          if (fetchCount === 1) {
+            return Response.json({ keys: [publicJwk1] }, { status: 200 });
+          } else {
+            return Response.json({ keys: [publicJwk1, publicJwk2] }, { status: 200 });
+          }
+        }
+        return new Response("Not found", { status: 404 });
+      });
+
+      const testEnv = {
+        ...env,
+        CF_ACCESS_TEAM_DOMAIN: "test-cache-team",
+        CF_ACCESS_AUD: "test-aud"
+      };
+
+      const now = Math.floor(Date.now() / 1000);
+      const jwt1 = await signTestJwt(
+        { email: "user@example.com", iss: "https://test-cache-team.cloudflareaccess.com", aud: "test-aud", exp: now + 3600 },
+        keyPair1.privateKey,
+        "cached-kid-1"
+      );
+
+      // First verification: fetches JWKS
+      const res1 = await verifyCloudflareAccessJwt(jwt1, testEnv as any);
+      expect(res1.valid).toBe(true);
+      expect(fetchCount).toBe(1);
+
+      // Second verification with same kid: uses cache without fetching
+      const res2 = await verifyCloudflareAccessJwt(jwt1, testEnv as any);
+      expect(res2.valid).toBe(true);
+      expect(fetchCount).toBe(1);
+
+      // Verification with new unknown kid: triggers controlled single refresh
+      const jwt2 = await signTestJwt(
+        { email: "user@example.com", iss: "https://test-cache-team.cloudflareaccess.com", aud: "test-aud", exp: now + 3600 },
+        keyPair2.privateKey,
+        "refreshed-kid-2"
+      );
+      const res3 = await verifyCloudflareAccessJwt(jwt2, testEnv as any);
+      expect(res3.valid).toBe(true);
+      expect(fetchCount).toBe(2);
+
+      // Repeated unknown kid does not trigger flood
+      const jwtBad = await signTestJwt(
+        { email: "user@example.com", iss: "https://test-cache-team.cloudflareaccess.com", aud: "test-aud", exp: now + 3600 },
+        keyPair1.privateKey,
+        "non-existent-kid"
+      );
+      const resBad1 = await verifyCloudflareAccessJwt(jwtBad, testEnv as any);
+      expect(resBad1.valid).toBe(false);
+      const resBad2 = await verifyCloudflareAccessJwt(jwtBad, testEnv as any);
+      expect(resBad2.valid).toBe(false);
+      expect(fetchCount).toBe(3); // only refreshed once for the non-existent kid, then negative cached
     });
 
     it("never trusts Cf-Access-Authenticated-User-Email alone without verified assertion or HMAC", async () => {
@@ -497,6 +707,145 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(html).toContain("Authorize Untrusted Client App");
       expect(html).toContain("name=\"csrf_token\"");
       expect(html).toContain("name=\"consent_action\"");
+    });
+
+
+    it("escapes malicious client names, URLs, and attributes to prevent XSS (Greptile P1)", async () => {
+      const authSecret = "test-auth-secret";
+      const testEnv = {
+        ...env,
+        ALLOWED_USERS: "user@example.com",
+        AUTH_SECRET: authSecret,
+        CONSENT_CSRF_SECRET: "csrf-secret-12345",
+        MCP_RESOURCE: "http://example.com/mcp"
+      };
+
+      const maliciousName = `"><script>alert(1)</script><img src=x onerror=alert(2)>`;
+      const regReq = new Request("http://example.com/oauth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: maliciousName,
+          redirect_uris: ["https://example.com/cb"],
+          token_endpoint_auth_method: "client_secret_basic"
+        })
+      });
+      const ctx1 = createExecutionContext();
+      const regRes = await worker.fetch(regReq, testEnv as any, ctx1);
+      const regData = await regRes.json<any>();
+
+      const enc = new TextEncoder();
+      const key = await crypto.subtle.importKey(
+        "raw",
+        enc.encode(authSecret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+      const sig = await crypto.subtle.sign("HMAC", key, enc.encode("user@example.com"));
+      const sigHex = Array.from(new Uint8Array(sig))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      const authReq = new Request(
+        `http://example.com/oauth/authorize?response_type=code&client_id=${regData.client_id}&redirect_uri=https://example.com/cb&code_challenge=xyz&code_challenge_method=S256&scope=mcp&state=mystate`,
+        {
+          headers: {
+            "X-Auth-User": "user@example.com",
+            "X-Auth-Signature": sigHex
+          }
+        }
+      );
+      const ctx2 = createExecutionContext();
+      const authRes = await worker.fetch(authReq, testEnv as any, ctx2);
+      await waitOnExecutionContext(ctx2);
+
+      expect(authRes.status).toBe(200);
+      const csp = authRes.headers.get("Content-Security-Policy");
+      expect(csp).toContain("default-src 'none'");
+      expect(csp).toContain("form-action 'self'");
+      expect(authRes.headers.get("X-Frame-Options")).toBe("DENY");
+      expect(authRes.headers.get("X-Content-Type-Options")).toBe("nosniff");
+
+      const html = await authRes.text();
+      expect(html).not.toContain("<script>alert(1)</script>");
+      expect(html).not.toContain("<img src=x onerror=alert(2)>");
+      expect(html).toContain("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;");
+    });
+
+    it("rejects unsafe URL schemes during registration (e.g. javascript:, data:)", async () => {
+      const regReq = new Request("http://example.com/oauth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Malicious Scheme Client",
+          redirect_uris: ["javascript:alert(1)"],
+          token_endpoint_auth_method: "client_secret_basic"
+        })
+      });
+      const ctx = createExecutionContext();
+      const regRes = await worker.fetch(regReq, env as any, ctx);
+      expect(regRes.status).toBe(400);
+      const data = await regRes.json<any>();
+      expect(data.error).toBe("invalid_client_metadata");
+      expect(data.error_description).toContain("Invalid redirect URI");
+    });
+
+    it("enforces strong CSRF token validation, transaction binding, and atomic concurrency replay protection (Greptile P1)", async () => {
+      const secret = "high-entropy-consent-csrf-secret-999";
+      const clientId = "client-abc";
+      const redirectUri = "https://example.com/cb";
+      const userId = "alice@example.com";
+      const codeChallenge = "challenge-123";
+
+      // 1. Generation and successful verification
+      const token = await createConsentCsrfToken(clientId, redirectUri, userId, codeChallenge, secret);
+      expect(token).toBeDefined();
+
+      // 2. Concurrency guarantee: 5 simultaneous submissions with identical token, exactly 1 succeeds
+      const attempts = await Promise.all([
+        verifyAndConsumeConsentCsrfToken(token, clientId, redirectUri, userId, codeChallenge, secret),
+        verifyAndConsumeConsentCsrfToken(token, clientId, redirectUri, userId, codeChallenge, secret),
+        verifyAndConsumeConsentCsrfToken(token, clientId, redirectUri, userId, codeChallenge, secret),
+        verifyAndConsumeConsentCsrfToken(token, clientId, redirectUri, userId, codeChallenge, secret),
+        verifyAndConsumeConsentCsrfToken(token, clientId, redirectUri, userId, codeChallenge, secret)
+      ]);
+      const successfulAttempts = attempts.filter((r) => r === true);
+      expect(successfulAttempts.length).toBe(1);
+
+      // 3. Replay rejection: subsequent verification fails
+      const replayResult = await verifyAndConsumeConsentCsrfToken(
+        token,
+        clientId,
+        redirectUri,
+        userId,
+        codeChallenge,
+        secret
+      );
+      expect(replayResult).toBe(false);
+
+      // 4. Missing secret fails closed
+      const missingSecretResult = await verifyAndConsumeConsentCsrfToken(
+        token,
+        clientId,
+        redirectUri,
+        userId,
+        codeChallenge,
+        undefined
+      );
+      expect(missingSecretResult).toBe(false);
+
+      // 5. Transaction binding mismatch
+      const freshToken = await createConsentCsrfToken(clientId, redirectUri, userId, codeChallenge, secret);
+      const wrongClientResult = await verifyAndConsumeConsentCsrfToken(
+        freshToken,
+        "different-client",
+        redirectUri,
+        userId,
+        codeChallenge,
+        secret
+      );
+      expect(wrongClientResult).toBe(false);
     });
 
     it("rejects unauthorized scopes or invalid target resources", async () => {
@@ -730,6 +1079,124 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(callText).toContain("E2E Antigravity task executed successfully");
     });
 
+    it("verifies OAuth provider denial, revocation, and token lifecycle contracts", async () => {
+      const authSecret = "provider-lifecycle-secret";
+
+      // 1. Register Client
+      const regReq = new Request("http://example.com/oauth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Lifecycle Client",
+          redirect_uris: ["https://example.com/cb"],
+          token_endpoint_auth_method: "client_secret_post"
+        })
+      });
+      const ctx1 = createExecutionContext();
+      const regRes = await worker.fetch(regReq, env as any, ctx1);
+      const regData = await regRes.json<any>();
+      const clientId = regData.client_id;
+      const clientSecret = regData.client_secret;
+
+      const testEnv = {
+        ...env,
+        ALLOWED_USERS: "user@example.com",
+        AUTH_SECRET: authSecret,
+        CONSENT_CSRF_SECRET: "csrf-secret-life",
+        MCP_RESOURCE: "http://example.com/mcp",
+        TRUSTED_CLIENT_IDS: clientId
+      };
+
+      // 2. PKCE setup
+      const codeVerifier = "abcdefghijklmnopqrstuvwxyz0123456789-._~ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      const enc = new TextEncoder();
+      const hash = await crypto.subtle.digest("SHA-256", enc.encode(codeVerifier));
+      let bin = "";
+      const hBytes = new Uint8Array(hash);
+      for (let i = 0; i < hBytes.byteLength; i++) {
+        bin += String.fromCharCode(hBytes[i]);
+      }
+      const codeChallenge = btoa(bin).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+
+      const key = await crypto.subtle.importKey(
+        "raw",
+        enc.encode(authSecret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+      const sig = await crypto.subtle.sign("HMAC", key, enc.encode("user@example.com"));
+      const sigHex = Array.from(new Uint8Array(sig))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      // 3. Obtain authorization code
+      const authReq = new Request(
+        `http://example.com/oauth/authorize?response_type=code&client_id=${clientId}&redirect_uri=https://example.com/cb&code_challenge=${codeChallenge}&code_challenge_method=S256&scope=mcp&state=mystate&resource=http://example.com/mcp`,
+        {
+          headers: {
+            "X-Auth-User": "user@example.com",
+            "X-Auth-Signature": sigHex
+          }
+        }
+      );
+      const ctx2 = createExecutionContext();
+      const authRes = await worker.fetch(authReq, testEnv as any, ctx2);
+      expect(authRes.status).toBe(302);
+      const loc = new URL(authRes.headers.get("Location")!);
+      const code = loc.searchParams.get("code")!;
+
+      // 4. Exchange code for access token & refresh token
+      const tokenBody = new URLSearchParams();
+      tokenBody.set("grant_type", "authorization_code");
+      tokenBody.set("client_id", clientId);
+      tokenBody.set("client_secret", clientSecret);
+      tokenBody.set("code", code);
+      tokenBody.set("redirect_uri", "https://example.com/cb");
+      tokenBody.set("code_verifier", codeVerifier);
+
+      const tokenReq = new Request("http://example.com/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: tokenBody.toString()
+      });
+      const ctx3 = createExecutionContext();
+      const tokenRes = await worker.fetch(tokenReq, testEnv as any, ctx3);
+      const tokenData = await tokenRes.json<any>();
+      expect(tokenData.access_token).toBeDefined();
+
+      const accessToken = tokenData.access_token;
+
+      // 5. Revoke access token via provider revocation endpoint (POST /oauth/token with token parameter)
+      const revokeBody = new URLSearchParams();
+      revokeBody.set("client_id", clientId);
+      revokeBody.set("client_secret", clientSecret);
+      revokeBody.set("token", accessToken);
+
+      const revokeReq = new Request("http://example.com/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: revokeBody.toString()
+      });
+      const ctx4 = createExecutionContext();
+      const revokeRes = await worker.fetch(revokeReq, testEnv as any, ctx4);
+      expect(revokeRes.status).toBe(200);
+
+      // 6. Accessing /mcp with revoked token fails with 401
+      const mcpReq = new Request("http://example.com/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/list", params: {} })
+      });
+      const ctx5 = createExecutionContext();
+      const mcpRes = await worker.fetch(mcpReq, testEnv as any, ctx5);
+      expect(mcpRes.status).toBe(401);
+      expect(mcpRes.headers.get("WWW-Authenticate")).toContain("invalid_token");
+    });
+
     it("rejects token with wrong audience or expired timestamp", async () => {
       const now = Math.floor(Date.now() / 1000);
       const userId = "alice";
@@ -861,18 +1328,61 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(await res.text()).toContain("Invalid Host header");
     });
 
-    it("returns dynamic CORS headers reflecting allowed origin", async () => {
-      const req = new Request("http://example.com/mcp", {
+    it("returns dynamic CORS headers reflecting allowed origin and rejects untrusted origins (Greptile P2)", async () => {
+      const testEnv = {
+        ...env,
+        ALLOWED_ORIGINS: "https://claude.ai,https://trusted-client.com"
+      };
+
+      // 1. Allowed origin receives CORS headers on OPTIONS
+      const reqAllowed = new Request("http://example.com/mcp", {
         method: "OPTIONS",
         headers: { Origin: "https://claude.ai" }
       });
-      const ctx = createExecutionContext();
-      const res = await worker.fetch(req, env as any, ctx);
+      const ctx1 = createExecutionContext();
+      const resAllowed = await worker.fetch(reqAllowed, testEnv as any, ctx1);
 
-      expect(res.status).toBe(204);
-      expect(res.headers.get("Access-Control-Allow-Origin")).toBe("https://claude.ai");
-      expect(res.headers.get("Vary")).toBe("Origin");
-      expect(res.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+      expect(resAllowed.status).toBe(204);
+      expect(resAllowed.headers.get("Access-Control-Allow-Origin")).toBe("https://claude.ai");
+      expect(resAllowed.headers.get("Vary")).toBe("Origin");
+      expect(resAllowed.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+
+      // 2. Untrusted origin is rejected
+      const reqUntrusted = new Request("http://example.com/mcp", {
+        method: "OPTIONS",
+        headers: { Origin: "https://evil-attacker.com" }
+      });
+      const ctx2 = createExecutionContext();
+      const resUntrusted = await worker.fetch(reqUntrusted, testEnv as any, ctx2);
+      expect(resUntrusted.status).toBe(403);
+      expect(await resUntrusted.text()).toContain("Unauthorized Origin");
+
+      // 3. Origin: null is rejected by default
+      const reqNullOrigin = new Request("http://example.com/mcp", {
+        method: "OPTIONS",
+        headers: { Origin: "null" }
+      });
+      const ctx3 = createExecutionContext();
+      const resNullOrigin = await worker.fetch(reqNullOrigin, testEnv as any, ctx3);
+      expect(resNullOrigin.status).toBe(403);
+      expect(await resNullOrigin.text()).toContain("Origin 'null' is not allowed");
+
+      // 4. Request without Origin header succeeds for legitimate non-browser clients
+      const reqNoOrigin = new Request("http://example.com/.well-known/oauth-protected-resource/mcp", {
+        method: "GET"
+      });
+      const ctx4 = createExecutionContext();
+      const resNoOrigin = await worker.fetch(reqNoOrigin, testEnv as any, ctx4);
+      expect(resNoOrigin.status).toBe(200);
+
+      // 5. Unexpected Host header mismatch is rejected
+      const reqBadHost = new Request("http://example.com/mcp", {
+        headers: { Host: "attacker.com" }
+      });
+      const ctx5 = createExecutionContext();
+      const resBadHost = await worker.fetch(reqBadHost, testEnv as any, ctx5);
+      expect(resBadHost.status).toBe(403);
+      expect(await resBadHost.text()).toContain("Invalid Host header");
     });
   });
 
