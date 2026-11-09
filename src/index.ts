@@ -444,7 +444,7 @@ function pruneNegativeCache(now: number): void {
 
 /**
  * Fetches and caches Cloudflare Access JWKS keys with:
- * - Bounded cache size and LRU eviction
+ * - Bounded cache size and FIFO eviction
  * - Per-team-domain refresh cooldown
  * - In-flight promise deduplication
  * - Schema and key validation
@@ -480,8 +480,7 @@ export async function getCachedAccessJwks(teamDomain: string, kid?: string): Pro
   if (cached && kid) {
     const lastUnknownRefresh = teamLastUnknownKidRefreshTime.get(teamDomain) || 0;
     if (lastUnknownRefresh > 0 && now - lastUnknownRefresh < TEAM_REFRESH_COOLDOWN_MS) {
-      // Cooldown active after an unknown-key refresh: negative cache kid and return existing cached jwks without upstream fetch
-      unknownKidNegativeCache.set(`${teamDomain}:${kid}`, now);
+      // Cooldown active after an unknown-key refresh: return existing cached jwks without upstream fetch
       return cached.jwks;
     }
   }

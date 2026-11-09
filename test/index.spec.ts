@@ -9,9 +9,22 @@ import worker, {
   validateWorkspaceFiles,
   createConsentCsrfToken,
   verifyAndConsumeConsentCsrfToken,
-  clearJwksCache
+  clearJwksCache,
+  CSRF_NONCE_RETENTION_MS,
+  getCachedAccessJwks,
+  MAX_JWKS_CACHE_SIZE,
+  MAX_NEGATIVE_CACHE_SIZE,
+  JWKS_CACHE_TTL_MS,
+  NEGATIVE_KID_TTL_MS,
+  TEAM_REFRESH_COOLDOWN_MS
 } from "../src/index";
-import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import {
+  env,
+  createExecutionContext,
+  waitOnExecutionContext,
+  runInDurableObject,
+  runDurableObjectAlarm
+} from "cloudflare:test";
 
 // Helpers for Cloudflare Access JWT testing
 async function generateTestRsaKeyPair(): Promise<CryptoKeyPair> {
@@ -1714,7 +1727,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(postJson.error_description).toContain("CONSENT_CSRF_SECRET is required");
     });
 
-    it("verifies real SQLite-backed CONSENT_COORDINATOR Durable Object atomicity, persistence, and alarm cleanup", async () => {
+    it("verifies real SQLite-backed CONSENT_COORDINATOR Durable Object atomicity, concurrency, and persistence", async () => {
       const coordinator = env.CONSENT_COORDINATOR;
       expect(coordinator).toBeDefined();
 
@@ -1778,8 +1791,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(successCount).toBe(1);
       expect(conflictCount).toBe(4);
 
-      // 4. Persistence across separate stub invocations and distinct instances
-      // Getting another stub to the same ID maintains persistence
+      // 4. Persistence across separate stub references for the same ID
+      // Obtaining a separate stub reference to the same Durable Object ID accesses the same persisted state in SQLite storage (note: this does not simulate a process restart or DO eviction).
       const stub2 = coordinator.get(id);
       const resPersisted = await stub2.fetch("https://coordinator/consume", {
         method: "POST",
@@ -1819,9 +1832,331 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       });
       expect(invalidNonce.status).toBe(400);
     });
+
+    it("verifies Durable Object alarm scheduling, expired nonce cleanup, and rescheduling behavior", async () => {
+      const coordinator = env.CONSENT_COORDINATOR;
+      expect(coordinator).toBeDefined();
+
+      const id = coordinator.idFromName("test-alarm-lifecycle-do");
+      const stub = coordinator.get(id);
+
+      // 1. Consume a nonce and verify that an alarm is scheduled
+      const freshNonce = "11112222333344445555666677778888";
+      const consumeRes = await stub.fetch("https://coordinator/consume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nonce: freshNonce })
+      });
+      expect(consumeRes.status).toBe(200);
+
+      const scheduledAlarm = await runInDurableObject(stub, async (_instance, state) => {
+        return await state.storage.getAlarm();
+      });
+      expect(scheduledAlarm).not.toBeNull();
+      expect(scheduledAlarm!).toBeGreaterThan(Date.now());
+
+      // 2. Seed both expired and unexpired nonce records using runInDurableObject
+      const now = Date.now();
+      const expiredNonce1 = "aaaa1111222233334444555566667777";
+      const expiredNonce2 = "bbbb1111222233334444555566667777";
+      const unexpiredNonce1 = "cccc1111222233334444555566667777";
+      const unexpiredNonce2 = "dddd1111222233334444555566667777";
+
+      const expiredTime = now - CSRF_NONCE_RETENTION_MS - 10000;
+      const unexpiredTime = now - 60000; // 1 minute ago, within 15 min retention
+
+      await runInDurableObject(stub, (_instance, state) => {
+        state.storage.sql.exec(
+          `INSERT OR REPLACE INTO consumed_nonces (nonce, consumed_at) VALUES
+           (?, ?), (?, ?), (?, ?), (?, ?)`,
+          expiredNonce1, expiredTime,
+          expiredNonce2, expiredTime - 5000,
+          unexpiredNonce1, unexpiredTime,
+          unexpiredNonce2, unexpiredTime + 10000
+        );
+      });
+
+      // 3. Trigger the alarm without waiting for real time
+      const ranAlarm1 = await runDurableObjectAlarm(stub);
+      expect(ranAlarm1).toBe(true);
+
+      // 4. Verify that expired records are deleted and unexpired records remain
+      const remainingRecords = await runInDurableObject(stub, (_instance, state) => {
+        return state.storage.sql.exec("SELECT nonce FROM consumed_nonces").toArray() as { nonce: string }[];
+      });
+      const remainingNonces = remainingRecords.map((r) => r.nonce);
+      expect(remainingNonces).toContain(unexpiredNonce1);
+      expect(remainingNonces).toContain(unexpiredNonce2);
+      expect(remainingNonces).not.toContain(expiredNonce1);
+      expect(remainingNonces).not.toContain(expiredNonce2);
+
+      // 5. Verify that another alarm is scheduled for the remaining records
+      const rescheduledAlarm = await runInDurableObject(stub, async (_instance, state) => {
+        return await state.storage.getAlarm();
+      });
+      expect(rescheduledAlarm).not.toBeNull();
+      expect(rescheduledAlarm!).toBeGreaterThan(Date.now());
+
+      // 6. Make all remaining records expired and trigger the alarm again
+      await runInDurableObject(stub, (_instance, state) => {
+        const pastCutoff = Date.now() - CSRF_NONCE_RETENTION_MS - 5000;
+        state.storage.sql.exec("UPDATE consumed_nonces SET consumed_at = ?", pastCutoff);
+      });
+
+      const ranAlarm2 = await runDurableObjectAlarm(stub);
+      expect(ranAlarm2).toBe(true);
+
+      // 7. Verify that the table is empty and no further alarm is scheduled
+      const recordCount = await runInDurableObject(stub, (_instance, state) => {
+        const rows = state.storage.sql.exec("SELECT count(*) as cnt FROM consumed_nonces").toArray() as { cnt: number }[];
+        return rows[0].cnt;
+      });
+      expect(recordCount).toBe(0);
+
+      const finalAlarm = await runInDurableObject(stub, async (_instance, state) => {
+        return await state.storage.getAlarm();
+      });
+      expect(finalAlarm).toBeNull();
+    });
   });
 
   describe("8. Bounded JWKS Cache & Key Rotation Verification", () => {
+    it("preserves rotated key availability across cooldown without falsely caching negative entry (P2 rotation bug regression)", async () => {
+      clearJwksCache();
+      let fakeTime = 1700000000000;
+      vi.spyOn(Date, "now").mockImplementation(() => fakeTime);
+
+      const teamDomain = "rotation-team";
+      const keyPairOld = await generateTestRsaKeyPair();
+      const keyPairNew = await generateTestRsaKeyPair();
+
+      const publicJwkOld = (await crypto.subtle.exportKey("jwk", keyPairOld.publicKey)) as any;
+      publicJwkOld.kid = "old-kid-1";
+      const publicJwkNew = (await crypto.subtle.exportKey("jwk", keyPairNew.publicKey)) as any;
+      publicJwkNew.kid = "new-rotated-kid-2";
+
+      let upstreamKeys = [publicJwkOld];
+      let fetchCount = 0;
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (info) => {
+        const urlStr = typeof info === "string" ? info : (info as any).url;
+        if (urlStr.includes("access/certs")) {
+          fetchCount++;
+          return Response.json({ keys: upstreamKeys }, { status: 200 });
+        }
+        return new Response("Not found", { status: 404 });
+      });
+
+      const testEnv = {
+        ...env,
+        CF_ACCESS_TEAM_DOMAIN: teamDomain,
+        CF_ACCESS_AUD: "test-aud"
+      };
+
+      const nowSec = () => Math.floor(fakeTime / 1000);
+      const makeJwt = (keyPair: CryptoKeyPair, kid: string) =>
+        signTestJwt(
+          { email: "user@example.com", iss: `https://${teamDomain}.cloudflareaccess.com`, aud: "test-aud", exp: nowSec() + 3600 },
+          keyPair.privateKey,
+          kid
+        );
+
+      // 1. Caches an old JWKS
+      const jwtOld = await makeJwt(keyPairOld, "old-kid-1");
+      const res1 = await verifyCloudflareAccessJwt(jwtOld, testEnv as any);
+      expect(res1.valid).toBe(true);
+      expect(fetchCount).toBe(1);
+
+      // 2. Triggers an unknown-key refresh to establish the team cooldown
+      const jwtUnknown = await makeJwt(keyPairOld, "unknown-kid-dummy");
+      const res2 = await verifyCloudflareAccessJwt(jwtUnknown, testEnv as any);
+      expect(res2.valid).toBe(false);
+      expect(fetchCount).toBe(2); // upstream refresh triggered and establishes cooldown
+
+      // 3. Simulates the upstream JWKS changing to include a legitimate new "kid"
+      upstreamKeys = [publicJwkOld, publicJwkNew];
+
+      // 4. Requests that new "kid" during the cooldown (e.g. 2 seconds after cooldown established)
+      fakeTime += 2000; // 2 seconds in, well within 10s cooldown
+      const jwtNew = await makeJwt(keyPairNew, "new-rotated-kid-2");
+      const res3 = await verifyCloudflareAccessJwt(jwtNew, testEnv as any);
+      expect(res3.valid).toBe(false); // fails closed because cached JWKS didn't have it and cooldown blocked refresh
+      expect(fetchCount).toBe(2); // no upstream request during cooldown
+
+      // Also verify that requests for many distinct unknown "kid" values during the cooldown do not cause an upstream request
+      for (let i = 0; i < 20; i++) {
+        const jwtDummy = await makeJwt(keyPairOld, `cooldown-unknown-${i}`);
+        const dummyRes = await verifyCloudflareAccessJwt(jwtDummy, testEnv as any);
+        expect(dummyRes.valid).toBe(false);
+      }
+      expect(fetchCount).toBe(2); // still exactly 2, all suppressed by cooldown
+
+      // 5. Advances time beyond the cooldown (10s) but remains within the negative-cache TTL (60s)
+      fakeTime += 10000; // total elapsed since step 2 is 12 seconds: > TEAM_REFRESH_COOLDOWN_MS (10s), < NEGATIVE_KID_TTL_MS (60s)
+
+      // 6. Requests the same new "kid" again and verifies that the new JWKS is fetched and the key becomes available
+      const res4 = await verifyCloudflareAccessJwt(jwtNew, testEnv as any);
+      expect(res4.valid).toBe(true);
+      expect(res4.email).toBe("user@example.com");
+      expect(fetchCount).toBe(3); // fresh JWKS fetched and new key successfully verified!
+    });
+
+    it("serves from JWKS cache before TTL expiry and triggers fresh fetch after TTL expiry", async () => {
+      clearJwksCache();
+      let fakeTime = 1700000000000;
+      vi.spyOn(Date, "now").mockImplementation(() => fakeTime);
+
+      const teamDomain = "ttl-test-team";
+      let fetchCount = 0;
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (info) => {
+        const urlStr = typeof info === "string" ? info : (info as any).url;
+        if (urlStr.includes("access/certs")) {
+          fetchCount++;
+          return Response.json({ keys: [{ kid: "ttl-kid", kty: "RSA", n: "abc", e: "AQAB" }] }, { status: 200 });
+        }
+        return new Response("Not found", { status: 404 });
+      });
+
+      // 1. Initial fetch
+      const jwks1 = await getCachedAccessJwks(teamDomain, "ttl-kid");
+      expect(jwks1.keys[0].kid).toBe("ttl-kid");
+      expect(fetchCount).toBe(1);
+
+      // 2. Advance time within TTL (e.g. 59 minutes, where JWKS_CACHE_TTL_MS is 60 minutes)
+      fakeTime += JWKS_CACHE_TTL_MS - 60000;
+      const jwks2 = await getCachedAccessJwks(teamDomain, "ttl-kid");
+      expect(jwks2.keys[0].kid).toBe("ttl-kid");
+      expect(fetchCount).toBe(1); // cache hit, no new fetch
+
+      // 3. Advance time past TTL (e.g. + 2 minutes, exceeding 60 minutes)
+      fakeTime += 120000;
+      const jwks3 = await getCachedAccessJwks(teamDomain, "ttl-kid");
+      expect(jwks3.keys[0].kid).toBe("ttl-kid");
+      expect(fetchCount).toBe(2); // TTL expired, fresh upstream fetch triggered
+    });
+
+    it("evicts oldest team domain JWKS when exceeding MAX_JWKS_CACHE_SIZE (FIFO eviction)", async () => {
+      clearJwksCache();
+      let fakeTime = 1700000000000;
+      vi.spyOn(Date, "now").mockImplementation(() => fakeTime);
+
+      let fetchedDomains: string[] = [];
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (info) => {
+        const urlStr = typeof info === "string" ? info : (info as any).url;
+        const match = urlStr.match(/https:\/\/([^.]+)\.cloudflareaccess\.com/);
+        if (match) {
+          fetchedDomains.push(match[1]);
+          return Response.json({ keys: [{ kid: `kid-${match[1]}`, kty: "RSA", n: "abc", e: "AQAB" }] }, { status: 200 });
+        }
+        return new Response("Not found", { status: 404 });
+      });
+
+      // Populate exactly MAX_JWKS_CACHE_SIZE entries (0 to 49)
+      for (let i = 0; i < MAX_JWKS_CACHE_SIZE; i++) {
+        await getCachedAccessJwks(`team-${i}`, `kid-team-${i}`);
+      }
+      expect(fetchedDomains.length).toBe(MAX_JWKS_CACHE_SIZE);
+
+      // Verify team-0 is cached (no new fetch)
+      fetchedDomains = [];
+      await getCachedAccessJwks("team-0", "kid-team-0");
+      expect(fetchedDomains.length).toBe(0);
+
+      // Insert 51st team domain -> triggers eviction of oldest inserted entry (team-0)
+      await getCachedAccessJwks("team-overflow", "kid-team-overflow");
+      expect(fetchedDomains).toEqual(["team-overflow"]);
+
+      // Verify team-1 (second inserted) is still cached
+      fetchedDomains = [];
+      await getCachedAccessJwks("team-1", "kid-team-1");
+      expect(fetchedDomains.length).toBe(0);
+
+      // Verify team-0 was evicted: requesting team-0 triggers an upstream fetch again
+      await getCachedAccessJwks("team-0", "kid-team-0");
+      expect(fetchedDomains).toEqual(["team-0"]);
+    });
+
+    it("expires negative cache entries after NEGATIVE_KID_TTL_MS", async () => {
+      clearJwksCache();
+      let fakeTime = 1700000000000;
+      vi.spyOn(Date, "now").mockImplementation(() => fakeTime);
+
+      const teamDomain = "neg-ttl-team";
+      let upstreamKeys: any[] = [];
+      let fetchCount = 0;
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (info) => {
+        const urlStr = typeof info === "string" ? info : (info as any).url;
+        if (urlStr.includes("access/certs")) {
+          fetchCount++;
+          return Response.json({ keys: upstreamKeys }, { status: 200 });
+        }
+        return new Response("Not found", { status: 404 });
+      });
+
+      // 1. Initial fetch with empty keys: kid-unknown is confirmed absent upstream and negatively cached
+      await getCachedAccessJwks(teamDomain, "kid-unknown");
+      expect(fetchCount).toBe(1);
+
+      // Upstream now adds kid-unknown
+      upstreamKeys = [{ kid: "kid-unknown", kty: "RSA", n: "abc", e: "AQAB" }];
+
+      // 2. Request during negative-cache TTL (e.g. 30s elapsed):
+      // advance past cooldown (10s) but within negative TTL (60s)
+      fakeTime += 30000;
+      await getCachedAccessJwks(teamDomain, "kid-unknown");
+      // Because kid-unknown is in negative cache, no new upstream fetch occurs
+      expect(fetchCount).toBe(1);
+
+      // 3. Advance past NEGATIVE_KID_TTL_MS (60s): total 65s elapsed
+      fakeTime += 35000; // total 65 seconds
+      const jwks = await getCachedAccessJwks(teamDomain, "kid-unknown");
+      expect(fetchCount).toBe(2); // negative cache expired, upstream fetched
+      expect(jwks.keys.some((k) => k.kid === "kid-unknown")).toBe(true);
+    });
+
+    it("enforces negative-cache size limit and evicts oldest entries (FIFO)", async () => {
+      clearJwksCache();
+      let fakeTime = 1700000000000;
+      vi.spyOn(Date, "now").mockImplementation(() => fakeTime);
+
+      let fetchCountByTeam: Record<string, number> = {};
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (info) => {
+        const urlStr = typeof info === "string" ? info : (info as any).url;
+        const match = urlStr.match(/https:\/\/([^.]+)\.cloudflareaccess\.com/);
+        if (match) {
+          const team = match[1];
+          fetchCountByTeam[team] = (fetchCountByTeam[team] || 0) + 1;
+          return Response.json({ keys: [] }, { status: 200 });
+        }
+        return new Response("Not found", { status: 404 });
+      });
+
+      // Fill negative cache with MAX_NEGATIVE_CACHE_SIZE entries (0 to 199)
+      for (let i = 0; i < MAX_NEGATIVE_CACHE_SIZE; i++) {
+        await getCachedAccessJwks(`neg-team-${i}`, "absent-kid");
+      }
+      expect(fetchCountByTeam["neg-team-0"]).toBe(1);
+
+      // Insert 201st negative entry (neg-team-overflow:absent-kid)
+      // This forces eviction of the oldest negative entry: neg-team-0:absent-kid
+      await getCachedAccessJwks("neg-team-overflow", "absent-kid");
+
+      // Advance time past the 10s team cooldown, but within the 60s negative cache TTL
+      fakeTime += 12000;
+
+      // neg-team-190:absent-kid was recently inserted, was NOT evicted from negative cache,
+      // and is still within MAX_JWKS_CACHE_SIZE:
+      await getCachedAccessJwks("neg-team-190", "absent-kid");
+      expect(fetchCountByTeam["neg-team-190"]).toBe(1);
+
+      // neg-team-0:absent-kid WAS evicted due to negative cache size limit (oldest entry evicted),
+      // so after cooldown it triggers a fresh fetch:
+      await getCachedAccessJwks("neg-team-0", "absent-kid");
+      expect(fetchCountByTeam["neg-team-0"]).toBe(2);
+    });
+
     it("deduplicates concurrent JWKS refreshes into a single fetch", async () => {
       clearJwksCache();
       const keyPair = await generateTestRsaKeyPair();
@@ -1842,11 +2177,11 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       // Launch 5 simultaneous requests for the same teamDomain
       const results = await Promise.all([
-        (await import("../src/index")).getCachedAccessJwks("dedup-team", "dedup-kid-1"),
-        (await import("../src/index")).getCachedAccessJwks("dedup-team", "dedup-kid-1"),
-        (await import("../src/index")).getCachedAccessJwks("dedup-team", "dedup-kid-1"),
-        (await import("../src/index")).getCachedAccessJwks("dedup-team", "dedup-kid-1"),
-        (await import("../src/index")).getCachedAccessJwks("dedup-team", "dedup-kid-1")
+        getCachedAccessJwks("dedup-team", "dedup-kid-1"),
+        getCachedAccessJwks("dedup-team", "dedup-kid-1"),
+        getCachedAccessJwks("dedup-team", "dedup-kid-1"),
+        getCachedAccessJwks("dedup-team", "dedup-kid-1"),
+        getCachedAccessJwks("dedup-team", "dedup-kid-1")
       ]);
 
       expect(fetchCount).toBe(1);
