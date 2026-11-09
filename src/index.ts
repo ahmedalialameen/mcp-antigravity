@@ -5,7 +5,7 @@ import { z } from "zod";
 export interface Env {
   CONSENT_CSRF_SECRET?: string;
   ALLOWED_ORIGINS?: string;
-  CONSENT_COORDINATOR?: DurableObjectNamespace;
+  CONSENT_COORDINATOR: DurableObjectNamespace;
   OAUTH_KV: KVNamespace;
   GEMINI_API_KEY: string;
   MCP_RESOURCE: string;
@@ -373,57 +373,161 @@ interface JwksCacheEntry {
   fetchedAt: number;
 }
 
+export const MAX_JWKS_CACHE_SIZE = 50;
+export const MAX_NEGATIVE_CACHE_SIZE = 200;
+export const JWKS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour TTL
+export const NEGATIVE_KID_TTL_MS = 60 * 1000; // 1 minute negative cache for unknown kid
+export const TEAM_REFRESH_COOLDOWN_MS = 10 * 1000; // 10 seconds cooldown between unknown-kid refreshes for a team domain
+
 const jwksMemoryCache = new Map<string, JwksCacheEntry>();
 const unknownKidNegativeCache = new Map<string, number>();
-const JWKS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour TTL
-const NEGATIVE_KID_TTL_MS = 60 * 1000; // 1 minute negative cache for unknown kid
+const teamLastUnknownKidRefreshTime = new Map<string, number>();
+const inFlightJwksRefreshes = new Map<string, Promise<{ keys: any[] }>>();
 
 export function clearJwksCache(): void {
   jwksMemoryCache.clear();
   unknownKidNegativeCache.clear();
+  teamLastUnknownKidRefreshTime.clear();
+  inFlightJwksRefreshes.clear();
 }
 
 /**
- * Fetches and caches Cloudflare Access JWKS keys with bounded TTL and single refresh on unknown kid.
+ * Validates the structure and contents of a JWKS response.
+ */
+export function validateJwksStructure(jwks: any): asserts jwks is { keys: any[] } {
+  if (!jwks || typeof jwks !== "object" || !Array.isArray(jwks.keys)) {
+    throw new Error("Invalid JWKS: Expected an object with a 'keys' array.");
+  }
+  for (const key of jwks.keys) {
+    if (!key || typeof key !== "object") {
+      throw new Error("Invalid JWKS key entry: Key must be an object.");
+    }
+  }
+}
+
+/**
+ * Validates that a JWK is suitable for RS256 signature verification.
+ */
+export function validateRsaJwk(key: any): void {
+  if (!key || typeof key !== "object") {
+    throw new Error("Key is not a valid JWK object");
+  }
+  if (key.kty !== "RSA") {
+    throw new Error(`Invalid key type '${key.kty}': expected RSA`);
+  }
+  if (key.alg !== undefined && key.alg !== "RS256") {
+    throw new Error(`Invalid key algorithm '${key.alg}': expected RS256`);
+  }
+  if (key.use !== undefined && key.use !== "sig") {
+    throw new Error(`Invalid key use '${key.use}': expected 'sig'`);
+  }
+  if (!key.n || typeof key.n !== "string" || !key.e || typeof key.e !== "string") {
+    throw new Error("Missing required RSA modulus (n) or public exponent (e)");
+  }
+}
+
+/**
+ * Evicts expired entries or oldest entries if cache exceeds max size.
+ */
+function pruneNegativeCache(now: number): void {
+  for (const [key, timestamp] of unknownKidNegativeCache.entries()) {
+    if (now - timestamp >= NEGATIVE_KID_TTL_MS) {
+      unknownKidNegativeCache.delete(key);
+    }
+  }
+  while (unknownKidNegativeCache.size >= MAX_NEGATIVE_CACHE_SIZE) {
+    const oldestKey = unknownKidNegativeCache.keys().next().value;
+    if (oldestKey) unknownKidNegativeCache.delete(oldestKey);
+    else break;
+  }
+}
+
+/**
+ * Fetches and caches Cloudflare Access JWKS keys with:
+ * - Bounded cache size and LRU eviction
+ * - Per-team-domain refresh cooldown
+ * - In-flight promise deduplication
+ * - Schema and key validation
  */
 export async function getCachedAccessJwks(teamDomain: string, kid?: string): Promise<{ keys: any[] }> {
   const now = Date.now();
   const cached = jwksMemoryCache.get(teamDomain);
 
-  // 1. If cache valid and contains kid, return immediately
+  // 1. If cached and valid, and contains kid (or kid not specified), return immediately
   if (cached && now - cached.fetchedAt < JWKS_CACHE_TTL_MS) {
     if (!kid || cached.jwks.keys?.some((k) => k.kid === kid)) {
       return cached.jwks;
     }
   }
 
-  // 2. Check negative cache for repeated requests with unknown kid to prevent fetch flooding
+  // 2. Check negative cache for repeated requests with unknown kid
+  pruneNegativeCache(now);
   if (kid) {
     const negCachedTime = unknownKidNegativeCache.get(`${teamDomain}:${kid}`);
     if (negCachedTime && now - negCachedTime < NEGATIVE_KID_TTL_MS) {
       if (cached) return cached.jwks;
+      throw new Error(`Key ID '${kid}' negatively cached`);
     }
   }
 
-  // 3. Perform bounded fetch
-  const certsUrl = `https://${teamDomain}.cloudflareaccess.com/cdn-cgi/access/certs`;
-  const res = await fetch(certsUrl);
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+  // 3. In-flight promise deduplication
+  const inFlight = inFlightJwksRefreshes.get(teamDomain);
+  if (inFlight) {
+    return inFlight;
   }
 
-  const freshJwks = (await res.json()) as { keys: any[] };
-  jwksMemoryCache.set(teamDomain, {
-    jwks: freshJwks,
-    fetchedAt: now
-  });
-
-  // If kid still not present, record in negative cache
-  if (kid && !freshJwks.keys?.some((k) => k.kid === kid)) {
-    unknownKidNegativeCache.set(`${teamDomain}:${kid}`, now);
+  // 4. Enforce per-team refresh cooldown for unknown keys if an unknown-key refresh already happened recently
+  if (cached && kid) {
+    const lastUnknownRefresh = teamLastUnknownKidRefreshTime.get(teamDomain) || 0;
+    if (lastUnknownRefresh > 0 && now - lastUnknownRefresh < TEAM_REFRESH_COOLDOWN_MS) {
+      // Cooldown active after an unknown-key refresh: negative cache kid and return existing cached jwks without upstream fetch
+      unknownKidNegativeCache.set(`${teamDomain}:${kid}`, now);
+      return cached.jwks;
+    }
   }
 
-  return freshJwks;
+  // 5. Fetch fresh JWKS with deduplication
+  const fetchPromise = (async () => {
+    try {
+      const certsUrl = `https://${teamDomain}.cloudflareaccess.com/cdn-cgi/access/certs`;
+      const res = await fetch(certsUrl);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const freshJwks = await res.json();
+      validateJwksStructure(freshJwks);
+
+      // Bound jwksMemoryCache size
+      if (jwksMemoryCache.size >= MAX_JWKS_CACHE_SIZE && !jwksMemoryCache.has(teamDomain)) {
+        const oldestDomain = jwksMemoryCache.keys().next().value;
+        if (oldestDomain) jwksMemoryCache.delete(oldestDomain);
+      }
+
+      jwksMemoryCache.set(teamDomain, {
+        jwks: freshJwks,
+        fetchedAt: Date.now()
+      });
+
+      // If this refresh was triggered by an unknown kid (cached was already present), update teamLastUnknownKidRefreshTime
+      if (cached && kid) {
+        teamLastUnknownKidRefreshTime.set(teamDomain, Date.now());
+      }
+
+      // If kid still not present in fresh JWKS, record in negative cache
+      if (kid && !freshJwks.keys?.some((k: any) => k.kid === kid)) {
+        pruneNegativeCache(Date.now());
+        unknownKidNegativeCache.set(`${teamDomain}:${kid}`, Date.now());
+      }
+
+      return freshJwks;
+    } finally {
+      inFlightJwksRefreshes.delete(teamDomain);
+    }
+  })();
+
+  inFlightJwksRefreshes.set(teamDomain, fetchPromise);
+  return fetchPromise;
 }
 
 export async function verifyCloudflareAccessJwt(
@@ -444,19 +548,23 @@ export async function verifyCloudflareAccessJwt(
       return { valid: false, error: `Unsupported JWT algorithm: ${header.alg}` };
     }
 
+    if (!header.kid || typeof header.kid !== "string" || header.kid.trim().length === 0 || header.kid.length > 128) {
+      return { valid: false, error: "Invalid or missing 'kid' in JWT header" };
+    }
+
     const now = Math.floor(Date.now() / 1000);
 
-    // exp validation: must exist, be numeric, and be in the future
-    if (payload.exp === undefined || typeof payload.exp !== "number") {
+    // exp validation: must exist, be finite numeric, and be in the future (> now)
+    if (payload.exp === undefined || typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
       return { valid: false, error: "JWT is missing numeric 'exp' claim" };
     }
-    if (payload.exp < now) {
+    if (payload.exp <= now) {
       return { valid: false, error: "JWT has expired" };
     }
 
-    // nbf validation: if present, must be numeric and <= now
+    // nbf validation: if present, must be finite numeric and <= now + 60 (clock skew)
     if (payload.nbf !== undefined) {
-      if (typeof payload.nbf !== "number" || payload.nbf > now + 60) {
+      if (typeof payload.nbf !== "number" || !Number.isFinite(payload.nbf) || payload.nbf > now + 60) {
         return { valid: false, error: "JWT is not yet valid (nbf)" };
       }
     }
@@ -510,6 +618,12 @@ export async function verifyCloudflareAccessJwt(
     const keyJwk = jwks.keys?.find((k) => k.kid === header.kid);
     if (!keyJwk) {
       return { valid: false, error: `Key ID (kid: ${header.kid}) not found in JWKS` };
+    }
+
+    try {
+      validateRsaJwk(keyJwk);
+    } catch (valErr: any) {
+      return { valid: false, error: `Invalid signing key in JWKS: ${valErr.message}` };
     }
 
     const cryptoKey = await crypto.subtle.importKey(
@@ -640,29 +754,99 @@ export async function authenticateAndAuthorizeUser(
  * Creates and verifies CSRF tokens bound to client ID, redirect URI, user ID, and code challenge.
  */
 /**
- * Global singleton set for in-worker atomic nonce consumption during requests.
- */
-const inMemoryConsumedNonces = new Set<string>();
-
-/**
  * Dedicated atomic consent coordinator class for Cloudflare Durable Objects.
+ * Uses embedded SQLite storage for transactional, persistent nonce consumption.
+ * Retains consumed nonces for 15 minutes (exceeding token TTL of 10 minutes)
+ * and schedules alarms for automatic periodic cleanup.
  */
+export const CSRF_NONCE_RETENTION_MS = 15 * 60 * 1000; // 15 minutes
+
 export class ConsentCoordinatorDO {
-  constructor(private state: any, private env: any) {}
+  private sql: SqlStorage;
+
+  constructor(private state: DurableObjectState, private env: Env) {
+    this.sql = this.state.storage.sql;
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS consumed_nonces (
+        nonce TEXT PRIMARY KEY,
+        consumed_at INTEGER NOT NULL
+      );
+    `);
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/consume") {
-      const nonce = url.searchParams.get("nonce");
-      if (!nonce) return new Response("missing nonce", { status: 400 });
-      const key = `csrf_consumed:${nonce}`;
-      const existing = await this.state.storage.get(key);
-      if (existing) {
-        return new Response(JSON.stringify({ consumed: false }), { status: 409 });
-      }
-      await this.state.storage.put(key, Date.now());
-      return new Response(JSON.stringify({ consumed: true }), { status: 200 });
+
+    // Accept only POST /consume
+    if (url.pathname !== "/consume") {
+      return new Response("Not found", { status: 404 });
     }
-    return new Response("Not found", { status: 404 });
+    if (request.method !== "POST") {
+      return new Response("Method not allowed", { status: 405 });
+    }
+
+    let nonce: string | undefined;
+    try {
+      const contentType = request.headers.get("Content-Type") || "";
+      if (contentType.includes("application/json")) {
+        const body = (await request.json()) as any;
+        nonce = body?.nonce;
+      } else {
+        const formData = await request.formData();
+        nonce = (formData.get("nonce") as string) || undefined;
+      }
+    } catch {
+      return new Response("Invalid request payload", { status: 400 });
+    }
+
+    if (!nonce || typeof nonce !== "string" || !/^[0-9a-fA-F]{16,64}$/.test(nonce)) {
+      return new Response("Invalid or missing nonce", { status: 400 });
+    }
+
+    const now = Date.now();
+
+    // Use transactionSync for atomic check-and-insert under SQLite storage semantics
+    const consumed = this.state.storage.transactionSync(() => {
+      const existing = this.sql.exec("SELECT consumed_at FROM consumed_nonces WHERE nonce = ?", nonce).toArray();
+      if (existing.length > 0) {
+        return false;
+      }
+      this.sql.exec("INSERT INTO consumed_nonces (nonce, consumed_at) VALUES (?, ?)", nonce, now);
+      return true;
+    });
+
+    if (!consumed) {
+      return new Response(JSON.stringify({ consumed: false }), {
+        status: 409,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // Schedule cleanup alarm if not already scheduled
+    const currentAlarm = await this.state.storage.getAlarm();
+    if (currentAlarm === null) {
+      await this.state.storage.setAlarm(Date.now() + CSRF_NONCE_RETENTION_MS);
+    }
+
+    return new Response(JSON.stringify({ consumed: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  /**
+   * Durable Object Alarm handler to prune expired consumed nonce records.
+   */
+  async alarm(): Promise<void> {
+    const cutoff = Date.now() - CSRF_NONCE_RETENTION_MS;
+    this.sql.exec("DELETE FROM consumed_nonces WHERE consumed_at < ?", cutoff);
+
+    // If there are still records, schedule next alarm based on oldest record
+    const remaining = this.sql.exec("SELECT MIN(consumed_at) as oldest FROM consumed_nonces").toArray();
+    if (remaining.length > 0 && remaining[0].oldest !== null && remaining[0].oldest !== undefined) {
+      const nextAlarmTime = Number(remaining[0].oldest) + CSRF_NONCE_RETENTION_MS;
+      await this.state.storage.setAlarm(Math.max(nextAlarmTime, Date.now() + 1000));
+    }
   }
 }
 
@@ -709,34 +893,47 @@ export async function createConsentCsrfToken(
 }
 
 /**
- * Atomically consumes a nonce using a dedicated coordinator or atomic store.
+ * Atomically consumes a nonce using the CONSENT_COORDINATOR Durable Object.
+ * Uses deterministic sharding by nonce (e.g. 16 shards: consent-coordinator-0..15)
+ * so that any given nonce always maps to the same coordinator instance,
+ * while distributed nonces avoid contention on a single Durable Object.
+ * Fails closed if the coordinator binding is unavailable.
  * Guarantees that two concurrent submissions with the same token/nonce cannot both succeed.
  */
+export const COORDINATOR_SHARDS = 16;
+
+export function getCoordinatorShardName(nonce: string): string {
+  // Deterministic shard calculation using first 2 hex chars of nonce
+  const prefix = nonce.slice(0, 2);
+  const shardIndex = parseInt(prefix, 16) % COORDINATOR_SHARDS;
+  return `consent-coordinator-shard-${shardIndex}`;
+}
+
 export async function consumeNonceAtomically(
   nonce: string,
   env?: Env
 ): Promise<boolean> {
-  if (env?.CONSENT_COORDINATOR) {
-    try {
-      const id = env.CONSENT_COORDINATOR.idFromName("consent-csrf-coordinator");
-      const stub = env.CONSENT_COORDINATOR.get(id);
-      const res = await stub.fetch(`https://coordinator/consume?nonce=${encodeURIComponent(nonce)}`);
-      if (res.ok) {
-        const body = (await res.json()) as { consumed: boolean };
-        return body.consumed === true;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
-  // Atomically check-and-insert in singleton set
-  if (inMemoryConsumedNonces.has(nonce)) {
+  if (!env || !env.CONSENT_COORDINATOR) {
     return false;
   }
-  inMemoryConsumedNonces.add(nonce);
-  return true;
+
+  try {
+    const shardName = getCoordinatorShardName(nonce);
+    const id = env.CONSENT_COORDINATOR.idFromName(shardName);
+    const stub = env.CONSENT_COORDINATOR.get(id);
+    const res = await stub.fetch("https://coordinator/consume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ nonce })
+    });
+    if (res.ok) {
+      const body = (await res.json()) as { consumed: boolean };
+      return body.consumed === true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -933,13 +1130,13 @@ export const oauth = new OAuthProvider({
             const formData = await request.formData();
             const action = formData.get("consent_action");
             const csrfToken = (formData.get("csrf_token") as string) || "";
-            const csrfSecret = env.CONSENT_CSRF_SECRET || env.AUTH_SECRET;
+            const csrfSecret = env.CONSENT_CSRF_SECRET;
 
             if (!csrfSecret) {
               return new Response(
                 JSON.stringify({
                   error: "server_error",
-                  error_description: "Consent CSRF configuration missing"
+                  error_description: "Consent CSRF configuration missing (CONSENT_CSRF_SECRET is required)"
                 }),
                 { status: 500, headers: { "Content-Type": "application/json" } }
               );
@@ -995,9 +1192,15 @@ export const oauth = new OAuthProvider({
 
           // Render interactive consent UI with CSRF protection and form submission
           const clientName = client.clientName || client.clientId;
-          const csrfSecret = env.CONSENT_CSRF_SECRET || env.AUTH_SECRET;
+          const csrfSecret = env.CONSENT_CSRF_SECRET;
           if (!csrfSecret) {
-            return new Response("Consent CSRF secret is not configured", { status: 500 });
+            return new Response(
+              JSON.stringify({
+                error: "server_error",
+                error_description: "Consent CSRF secret is not configured (CONSENT_CSRF_SECRET is required)"
+              }),
+              { status: 500, headers: { "Content-Type": "application/json" } }
+            );
           }
 
           const csrfToken = await createConsentCsrfToken(

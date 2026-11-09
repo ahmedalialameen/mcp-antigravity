@@ -10,6 +10,20 @@
       "id": "OAUTH_KV"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONSENT_COORDINATOR",
+        "class_name": "ConsentCoordinatorDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ConsentCoordinatorDO"]
+    }
+  ],
   "vars": {
     "MCP_RESOURCE": "https://antigravity-mcp-server.workers.dev/mcp",
     "ALLOWED_USERS": "user@example.com"

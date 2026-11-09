@@ -24,7 +24,7 @@ A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It 
 
 ## Setup & Configuration
 
-### 1. Create Cloudflare KV Namespace
+### 1. Create Cloudflare KV Namespace & Durable Object Coordinator
 
 Create the KV namespace used to persist OAuth clients, grants, and tokens:
 
@@ -32,7 +32,7 @@ Create the KV namespace used to persist OAuth clients, grants, and tokens:
 wrangler kv namespace create OAUTH_KV
 ```
 
-Update your `wrangler.jsonc` file with the generated namespace ID:
+`wrangler.jsonc` binds both `OAUTH_KV` and the required SQLite-backed Durable Object coordinator (`CONSENT_COORDINATOR`):
 
 ```jsonc
 "kv_namespaces": [
@@ -40,8 +40,24 @@ Update your `wrangler.jsonc` file with the generated namespace ID:
     "binding": "OAUTH_KV",
     "id": "<YOUR_KV_NAMESPACE_ID>"
   }
+],
+"durable_objects": {
+  "bindings": [
+    {
+      "name": "CONSENT_COORDINATOR",
+      "class_name": "ConsentCoordinatorDO"
+    }
+  ]
+},
+"migrations": [
+  {
+    "tag": "v1",
+    "new_sqlite_classes": ["ConsentCoordinatorDO"]
+  }
 ]
 ```
+
+The `ConsentCoordinatorDO` manages persistent, atomic single-use nonce consumption across worker isolates backed by SQLite storage with automatic alarm-based TTL pruning (15 minutes).
 
 ### 2. Configure Variables & Host/Origin Policies
 
@@ -61,20 +77,21 @@ Store a high-entropy secret used for cryptographic CSRF tokens on the OAuth cons
 ```bash
 wrangler secret put CONSENT_CSRF_SECRET
 ```
+*Note: `CONSENT_CSRF_SECRET` is mandatory for interactive consent. The server fails closed without falling back to any other secret.*
 
 #### B. Identity Authentication Method
 
 - **Method 1: Cloudflare Access JWT (Preferred)**
-  Protect your Worker behind Cloudflare Access. The server validates RS256 assertions (`Cf-Access-Jwt-Assertion`) using cached JWKS with fail-closed claim verification:
+  Protect your Worker behind Cloudflare Access. The server validates RS256 assertions (`Cf-Access-Jwt-Assertion`) using bounded cached JWKS with fail-closed claim verification:
   - Set `CF_ACCESS_TEAM_DOMAIN` (e.g. `"my-team"` which resolves JWKS from `https://my-team.cloudflareaccess.com/cdn-cgi/access/certs`).
   - Set `CF_ACCESS_AUD` to your Cloudflare Access Application Audience Tag. (Fails closed if missing or mismatched).
 
-- **Method 2: HMAC Identity Proxy (Alternative)**
-  When using a trusted proxy signing requests:
+- **Method 2: HMAC Identity Proxy (Dedicated Secret)**
+  When using a trusted proxy signing requests with `AUTH_SECRET`:
   ```bash
   wrangler secret put AUTH_SECRET
   ```
-  The proxy must provide `X-Auth-User` and `X-Auth-Signature` (HMAC-SHA256 of the user email).
+  The proxy must provide `X-Auth-User` and `X-Auth-Signature` (HMAC-SHA256 of the user email). `AUTH_SECRET` is dedicated strictly to HMAC proxy authentication and is never used as a CSRF fallback.
 
 #### C. Google Antigravity Agent API Key (Required)
 Store your Google Gemini / Interactions API key:
