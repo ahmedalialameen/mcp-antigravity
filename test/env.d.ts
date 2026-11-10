@@ -11,5 +11,7 @@ declare module "cloudflare:test" {
     CF_ACCESS_JWKS_JSON?: string;
     TRUSTED_CLIENT_IDS?: string;
     ALLOWED_HOSTS?: string;
+    GITHUB_MCP_READ_CREDENTIAL_ID?: string;
+    GITHUB_MCP_WRITE_CREDENTIAL_ID?: string;
   }
 }
