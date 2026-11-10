@@ -236,7 +236,7 @@ LIVE_TEST_GITHUB_PR=1 \
 npm test
 ```
 
-*Note on test repositories: Using a dedicated test repository (ideally private) with a known file is strongly preferred to verify fine-grained GitHub PAT repository authorization boundaries rather than public repositories.*
+*Note on test execution & authorization scope: The live integration test exercises the Cloudflare Worker `/mcp` entry-point handler, JSON-RPC dispatch, and Bearer token validation using a valid synthetic access token provisioned directly into the test environment's `OAUTH_KV`. It does not test the interactive browser OAuth PKCE authorization or user consent screen flow. Furthermore, using a dedicated private test repository with a known file snippet is mandatory to verify fine-grained GitHub PAT repository authorization boundaries.*
 
 ### TypeScript Validation
 

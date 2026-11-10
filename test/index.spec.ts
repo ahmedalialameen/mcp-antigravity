@@ -2792,9 +2792,15 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       async () => {
         const geminiApiKey = process.env.GEMINI_API_KEY!;
         const readCredId = process.env.GITHUB_MCP_READ_CREDENTIAL_ID!;
-        const testRepo = process.env.LIVE_TEST_GITHUB_REPO || "octocat/Hello-World";
+        const testRepo = process.env.LIVE_TEST_GITHUB_REPO?.trim();
+        const testExpectedFileSnippet = process.env.LIVE_TEST_EXPECTED_SNIPPET?.trim();
         const testPr = process.env.LIVE_TEST_GITHUB_PR ? parseInt(process.env.LIVE_TEST_GITHUB_PR, 10) : undefined;
-        const testExpectedFileSnippet = process.env.LIVE_TEST_EXPECTED_SNIPPET || "Hello World";
+
+        if (!testRepo || !testExpectedFileSnippet) {
+          throw new Error(
+            "Missing required configuration for live test: LIVE_TEST_GITHUB_REPO and LIVE_TEST_EXPECTED_SNIPPET must be set."
+          );
+        }
 
         const liveEnv: any = {
           ...env,
@@ -2903,30 +2909,62 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
           expect(hasStepsArray, "Expected interaction to contain 'steps' array").toBe(true);
 
           if (hasStepsArray) {
-            // Require evidence of GitHub MCP server get_file_contents execution
-            const hasGithubToolCall = parsedInteraction.steps.some((s: any) =>
-              (s.type === "mcp_server_tool_call" || s.type === "tool_call") &&
-              (s.server_name === "github" && s.name === "get_file_contents")
+            // 1. Locate the get_file_contents tool call on GitHub MCP
+            const getFileCall = parsedInteraction.steps.find((s: any) =>
+              s.type === "mcp_server_tool_call" &&
+              s.server_name === "github" &&
+              s.name === "get_file_contents"
             );
-            const hasGithubToolResult = parsedInteraction.steps.some((s: any) =>
-              (s.type === "mcp_server_tool_result" || s.type === "tool_result") &&
-              (s.server_name === "github" && s.name === "get_file_contents")
-            );
-
+            const hasGetFileCall = Boolean(getFileCall && getFileCall.id);
             expect(
-              hasGithubToolCall && hasGithubToolResult,
-              "Expected interaction steps to record GitHub MCP 'get_file_contents' tool call and tool result"
+              hasGetFileCall,
+              "Expected 'mcp_server_tool_call' step for GitHub 'get_file_contents' with an 'id'"
             ).toBe(true);
 
-            // If PR number provided, require pull_request_read tool execution
+            // 2. Correlate by call_id with mcp_server_tool_result
+            const callId = getFileCall?.id;
+            const getFileResult = parsedInteraction.steps.find((s: any) =>
+              s.type === "mcp_server_tool_result" &&
+              s.call_id === callId
+            );
+            const hasGetFileResult = Boolean(getFileResult);
+            expect(
+              hasGetFileResult,
+              "Expected matching 'mcp_server_tool_result' step with call_id matching get_file_contents tool call id"
+            ).toBe(true);
+
+            // Verify the tool result did not fail and contains expected file content
+            const isNotErrorResult = getFileResult && !getFileResult.isError && !getFileResult.error;
+            expect(isNotErrorResult, "Expected GitHub get_file_contents tool result to succeed without error").toBe(true);
+
+            const resultPayloadStr = JSON.stringify(getFileResult?.result || getFileResult?.content || getFileResult || "");
+            const resultContainsSnippet = resultPayloadStr.toLowerCase().includes(testExpectedFileSnippet.toLowerCase());
+            expect(
+              resultContainsSnippet,
+              "Expected GitHub get_file_contents tool result payload to contain expected file snippet"
+            ).toBe(true);
+
+            // If PR number provided, require correlated pull_request_read tool execution
             if (testPr !== undefined) {
-              const hasPrReadResult = parsedInteraction.steps.some((s: any) =>
-                (s.type === "mcp_server_tool_result" || s.type === "tool_result") &&
+              const prCall = parsedInteraction.steps.find((s: any) =>
+                s.type === "mcp_server_tool_call" &&
+                s.server_name === "github" &&
                 s.name === "pull_request_read"
               );
+              const hasPrCall = Boolean(prCall && prCall.id);
               expect(
-                hasPrReadResult,
-                "Expected interaction steps to record GitHub MCP 'pull_request_read' tool result"
+                hasPrCall,
+                "Expected 'mcp_server_tool_call' step for GitHub 'pull_request_read' with an 'id'"
+              ).toBe(true);
+
+              const prResult = parsedInteraction.steps.find((s: any) =>
+                s.type === "mcp_server_tool_result" &&
+                s.call_id === prCall?.id
+              );
+              const hasPrResult = Boolean(prResult && !prResult.isError && !prResult.error);
+              expect(
+                hasPrResult,
+                "Expected matching 'mcp_server_tool_result' step for 'pull_request_read' without error"
               ).toBe(true);
             }
           }
@@ -2948,15 +2986,18 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
             expect(mentionsPr, "Expected output to reference inspected pull request").toBe(true);
           }
 
-          // Secret sanitization checks using boolean assertions to avoid leaking strings on failure
-          const outputHasGithubPat = /ghp_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{20,}/.test(outputText);
-          expect(outputHasGithubPat, "Output must not contain GitHub PAT patterns").toBe(false);
+          // Complete secret scanning across the ENTIRE returned interaction structure
+          // (including all steps, tool calls, tool results, and output text)
+          const fullSerializedInteraction = JSON.stringify(parsedInteraction || resData || textContent);
+          const fullHasGithubPat = /ghp_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{20,}/.test(fullSerializedInteraction);
+          expect(fullHasGithubPat, "Entire interaction payload must not contain GitHub PAT patterns").toBe(false);
 
-          const outputHasGeminiKey = outputText.includes(geminiApiKey);
-          expect(outputHasGeminiKey, "Output must not contain the Gemini API key").toBe(false);
+          const fullHasGeminiKey = fullSerializedInteraction.includes(geminiApiKey);
+          expect(fullHasGeminiKey, "Entire interaction payload must not contain the Gemini API key").toBe(false);
         } catch (err: any) {
-          // Never forward raw error messages if they could contain secrets or tokens
-          const safeMessage = sanitizeSecret(err?.message || "Unknown live test failure", geminiApiKey)
+          // Never forward raw error messages or payloads if they could contain secrets or tokens
+          const rawErr = err?.message || "Unknown live test failure";
+          const safeMessage = sanitizeSecret(rawErr, geminiApiKey)
             .replace(/ghp_[a-zA-Z0-9]+/g, "[REDACTED_PAT]")
             .replace(/github_pat_[a-zA-Z0-9_]+/g, "[REDACTED_PAT]");
           throw new Error(`Live GitHub MCP Integration test failed: ${safeMessage}`);
