@@ -222,7 +222,7 @@ npm test
 
 #### Running Optional Gated Live Integration Tests
 
-The test suite includes gated live integration tests that test the live pathway (`Cloudflare Worker -> Google Interactions API -> Antigravity -> GitHub remote MCP -> GitHub`). These tests are disabled by default.
+The test suite includes gated live integration tests that test the live pathway (`Client HTTP Request -> Cloudflare Worker (/mcp) -> Bearer token validation -> MCP tools/call -> Google Interactions API -> Antigravity -> GitHub remote MCP -> GitHub`). These tests are disabled by default.
 
 To run the live GitHub MCP integration test against an external environment:
 
@@ -230,9 +230,13 @@ To run the live GitHub MCP integration test against an external environment:
 RUN_LIVE_GITHUB_MCP_TESTS=true \
 GEMINI_API_KEY="your-gemini-api-key" \
 GITHUB_MCP_READ_CREDENTIAL_ID="your-read-credential-id" \
-LIVE_TEST_GITHUB_REPO="octocat/Hello-World" \
+LIVE_TEST_GITHUB_REPO="your-org/your-private-test-repo" \
+LIVE_TEST_EXPECTED_SNIPPET="expected file snippet" \
+LIVE_TEST_GITHUB_PR=1 \
 npm test
 ```
+
+*Note on test repositories: Using a dedicated test repository (ideally private) with a known file is strongly preferred to verify fine-grained GitHub PAT repository authorization boundaries rather than public repositories.*
 
 ### TypeScript Validation
 
@@ -322,9 +326,9 @@ When `mode: "implement"` is specified, Antigravity follows a strictly defined li
 2. Creates a dedicated feature branch named `antigravity/<descriptive-task-name>`.
 3. Makes changes strictly on that feature branch.
 4. `push_files` must target that feature branch. Never pushes directly to the base branch.
-5. `create_pull_request` uses that feature branch as `head` and the specified `baseBranch` (or default branch) as `base`.
+5. `create_pull_request` must be invoked with `draft: true`, using that feature branch as `head` and the specified `baseBranch` (or default branch) as `base`.
 6. Runs relevant tests and reports their actual results.
-7. Opens a draft pull request and returns branch name, commit SHA, PR URL, and test results.
+7. Returns branch name, commit SHA, draft PR URL, and test results.
 8. Safety restrictions: Never calls `merge_pull_request`. Never force-pushes.
 
 *Note on authorization boundary: Because Google Antigravity invokes GitHub remote MCP tools directly without the Cloudflare Worker intercepting individual MCP tool arguments, the Worker cannot programmatically enforce the target branch string in `push_files`. GitHub branch protection rules or repository rulesets remain the mandatory authorization boundary preventing direct writes to default and protected branches.*

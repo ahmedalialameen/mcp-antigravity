@@ -2677,7 +2677,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(sentPayload.system_instruction).toContain("Determine the base branch: use 'main'");
       expect(sentPayload.system_instruction).toContain("antigravity/<descriptive-task-name>");
       expect(sentPayload.system_instruction).toContain("'push_files' must target that dedicated feature branch");
-      expect(sentPayload.system_instruction).toContain("'create_pull_request' must use that feature branch as 'head' and 'main' as 'base'");
+      expect(sentPayload.system_instruction).toContain("'create_pull_request' with 'draft: true' must use that feature branch as 'head' and 'main' as 'base'");
       expect(sentPayload.system_instruction).toContain("Never call 'merge_pull_request'");
       expect(sentPayload.system_instruction).toContain("Never force-push");
       expect(sentPayload.system_instruction).toContain("GitHub branch protection rulesets remain the authorization boundary");
@@ -2774,68 +2774,195 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
   describe("11. Gated Live GitHub Remote MCP Integration Test", () => {
     // Explicitly gated live integration test, disabled by default.
-    // Tests complete path: Cloudflare Worker -> Google Interactions API -> Antigravity -> GitHub remote MCP -> GitHub.
+    // Tests complete entry-point path:
+    // Client HTTP Request -> Cloudflare Worker (/mcp) -> Bearer token validation -> MCP tools/call ->
+    // Google Interactions API -> Antigravity Agent Runtime -> GitHub remote MCP -> GitHub.
     // Never runs in standard CI or local test runs unless explicitly opted-in via RUN_LIVE_GITHUB_MCP_TESTS=true
     // and external environment credentials are provided.
+    //
+    // Note on test repositories: Using a dedicated test repository (ideally private) with a known file
+    // is strongly preferred to verify fine-grained GitHub PAT repository authorization boundaries.
     const isLiveGithubMcpTestEnabled =
       process.env.RUN_LIVE_GITHUB_MCP_TESTS === "true" &&
       Boolean(process.env.GEMINI_API_KEY) &&
       Boolean(process.env.GITHUB_MCP_READ_CREDENTIAL_ID);
 
     it.skipIf(!isLiveGithubMcpTestEnabled)(
-      "verifies Google Antigravity initializes GitHub remote MCP and authenticates via managed credential (inspect/review mode)",
+      "verifies Google Antigravity initializes GitHub remote MCP and authenticates via managed credential through /mcp endpoint",
       async () => {
         const geminiApiKey = process.env.GEMINI_API_KEY!;
         const readCredId = process.env.GITHUB_MCP_READ_CREDENTIAL_ID!;
         const testRepo = process.env.LIVE_TEST_GITHUB_REPO || "octocat/Hello-World";
         const testPr = process.env.LIVE_TEST_GITHUB_PR ? parseInt(process.env.LIVE_TEST_GITHUB_PR, 10) : undefined;
+        const testExpectedFileSnippet = process.env.LIVE_TEST_EXPECTED_SNIPPET || "Hello World";
 
         const liveEnv: any = {
           ...env,
           GEMINI_API_KEY: geminiApiKey,
-          GITHUB_MCP_READ_CREDENTIAL_ID: readCredId
+          GITHUB_MCP_READ_CREDENTIAL_ID: readCredId,
+          MCP_RESOURCE: "http://example.com/mcp"
         };
 
-        // Construct task requesting file retrieval via GitHub MCP get_file_contents and pull_request_read if PR provided
-        let task = `Use GitHub MCP tools in read-only mode to inspect the repository '${testRepo}'. Retrieve and inspect the contents of README or README.md. Summarize the contents.`;
+        // 1. Issue a valid Bearer token bound to OAUTH_KV for the Worker /mcp endpoint
+        const testUserId = "live-tester@example.com";
+        const testGrantId = "grant-live-test";
+        const testSecret = "secret-live-1234567890abcdef";
+        const rawToken = `${testUserId}:${testGrantId}:${testSecret}`;
+
+        const encoder = new TextEncoder();
+        const hashBuf = await crypto.subtle.digest("SHA-256", encoder.encode(rawToken));
+        const tokenId = Array.from(new Uint8Array(hashBuf))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        await liveEnv.OAUTH_KV.put(
+          `token:${testUserId}:${testGrantId}:${tokenId}`,
+          JSON.stringify({
+            id: tokenId,
+            userId: testUserId,
+            grantId: testGrantId,
+            expiresAt: nowSec + 3600,
+            audience: "http://example.com/mcp",
+            grant: {
+              clientId: "live-test-client",
+              scope: ["mcp"]
+            }
+          })
+        );
+
+        // 2. Construct task requesting file retrieval via GitHub MCP get_file_contents and pull_request_read if PR provided
+        let task = `Use GitHub MCP tools in read-only mode to inspect the repository '${testRepo}'. Retrieve the contents of README or README.md. Quote the exact contents in your output.`;
         if (testPr !== undefined) {
-          task += ` Also use pull_request_read to inspect PR #${testPr}.`;
+          task += ` Also use pull_request_read to inspect PR #${testPr} and report its title and state.`;
         }
 
-        const repoContext = validateAndNormalizeRepoOptions({
-          repository: testRepo,
-          pullRequest: testPr,
-          mode: "inspect" // strictly read-only; no write operations in default live test
+        const mcpCallBody = {
+          jsonrpc: "2.0",
+          id: 100,
+          method: "tools/call",
+          params: {
+            name: "run_antigravity_agent",
+            arguments: {
+              task,
+              repository: testRepo,
+              pullRequest: testPr,
+              mode: "inspect" // strictly read-only; no write operations in default live test
+            }
+          }
+        };
+
+        const mcpReq = new Request("http://example.com/mcp", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${rawToken}`,
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream"
+          },
+          body: JSON.stringify(mcpCallBody)
         });
 
         // Ensure we catch and sanitize any errors so credentials/PATs are never leaked into test output
         try {
-          const result = await callAntigravityAgent(
-            geminiApiKey,
-            task,
-            undefined,
-            {
-              timeoutMs: 60000,
-              maxPollTimeMs: 180000,
-              maxPollIntervalMs: 2000
-            },
-            repoContext,
-            liveEnv
-          );
+          const ctx = createExecutionContext();
+          const response = await worker.fetch(mcpReq, liveEnv, ctx);
+          await waitOnExecutionContext(ctx);
 
-          expect(result).toBeDefined();
-          expect(result.status).toBe("completed");
+          const isHttpOk = response.status === 200;
+          expect(isHttpOk, "Expected HTTP 200 response from /mcp tool call").toBe(true);
 
-          // Redact / check that output text does not expose secret or token patterns
-          const resultStr = JSON.stringify(result);
-          expect(resultStr).not.toContain("ghp_");
-          expect(resultStr).not.toContain("github_pat_");
-          expect(resultStr).not.toContain(geminiApiKey);
+          const resData = await response.json<any>();
+          const isSuccessfulJsonRpc = resData && resData.id === 100 && !resData.error;
+          expect(isSuccessfulJsonRpc, "Expected valid JSON-RPC 2.0 tool result").toBe(true);
+
+          const toolResult = resData.result;
+          const isNotErrorTool = toolResult && !toolResult.isError;
+          expect(isNotErrorTool, "Expected tool execution to succeed without error flag").toBe(true);
+
+          const textContent = toolResult?.content?.[0]?.text;
+          const hasTextContent = typeof textContent === "string" && textContent.length > 0;
+          expect(hasTextContent, "Expected non-empty text content in tool result").toBe(true);
+
+          // Parse Antigravity interaction JSON payload from tool text
+          let parsedInteraction: any = null;
+          try {
+            parsedInteraction = JSON.parse(textContent);
+          } catch {
+            // Text may be wrapped or raw
+          }
+
+          const interactionCompleted =
+            parsedInteraction && parsedInteraction.status === "completed";
+          expect(
+            interactionCompleted,
+            "Expected Google Antigravity interaction to complete with status 'completed'"
+          ).toBe(true);
+
+          // Inspect interaction steps from the Interactions API runtime
+          const hasStepsArray = Array.isArray(parsedInteraction?.steps);
+          expect(hasStepsArray, "Expected interaction to contain 'steps' array").toBe(true);
+
+          if (hasStepsArray) {
+            // Require evidence of GitHub MCP server get_file_contents execution
+            const hasGithubToolCall = parsedInteraction.steps.some((s: any) =>
+              (s.type === "mcp_server_tool_call" || s.type === "tool_call") &&
+              (s.server_name === "github" && s.name === "get_file_contents")
+            );
+            const hasGithubToolResult = parsedInteraction.steps.some((s: any) =>
+              (s.type === "mcp_server_tool_result" || s.type === "tool_result") &&
+              (s.server_name === "github" && s.name === "get_file_contents")
+            );
+
+            expect(
+              hasGithubToolCall && hasGithubToolResult,
+              "Expected interaction steps to record GitHub MCP 'get_file_contents' tool call and tool result"
+            ).toBe(true);
+
+            // If PR number provided, require pull_request_read tool execution
+            if (testPr !== undefined) {
+              const hasPrReadResult = parsedInteraction.steps.some((s: any) =>
+                (s.type === "mcp_server_tool_result" || s.type === "tool_result") &&
+                s.name === "pull_request_read"
+              );
+              expect(
+                hasPrReadResult,
+                "Expected interaction steps to record GitHub MCP 'pull_request_read' tool result"
+              ).toBe(true);
+            }
+          }
+
+          // Verify non-empty output text confirming successful file retrieval
+          const outputText = parsedInteraction?.output_text || textContent;
+          const containsExpectedSnippet = outputText.toLowerCase().includes(testExpectedFileSnippet.toLowerCase());
+          expect(
+            containsExpectedSnippet,
+            "Expected interaction output to contain known file content from repository"
+          ).toBe(true);
+
+          // If test PR provided, verify PR was read
+          if (testPr !== undefined) {
+            const mentionsPr =
+              outputText.includes(`#${testPr}`) ||
+              outputText.toLowerCase().includes("pull request") ||
+              outputText.toLowerCase().includes("pr");
+            expect(mentionsPr, "Expected output to reference inspected pull request").toBe(true);
+          }
+
+          // Secret sanitization checks using boolean assertions to avoid leaking strings on failure
+          const outputHasGithubPat = /ghp_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{20,}/.test(outputText);
+          expect(outputHasGithubPat, "Output must not contain GitHub PAT patterns").toBe(false);
+
+          const outputHasGeminiKey = outputText.includes(geminiApiKey);
+          expect(outputHasGeminiKey, "Output must not contain the Gemini API key").toBe(false);
         } catch (err: any) {
-          const cleanMessage = sanitizeSecret(err?.message || "Live test failed", geminiApiKey);
-          throw new Error(`Live GitHub MCP Integration failed: ${cleanMessage}`);
+          // Never forward raw error messages if they could contain secrets or tokens
+          const safeMessage = sanitizeSecret(err?.message || "Unknown live test failure", geminiApiKey)
+            .replace(/ghp_[a-zA-Z0-9]+/g, "[REDACTED_PAT]")
+            .replace(/github_pat_[a-zA-Z0-9_]+/g, "[REDACTED_PAT]");
+          throw new Error(`Live GitHub MCP Integration test failed: ${safeMessage}`);
         }
-      }
+      },
+      360000 // 6-minute test timeout to cover initial request, bounded polling, and final response safely
     );
   });
 });

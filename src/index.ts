@@ -321,7 +321,7 @@ export async function callAntigravityAgent(
         "2. Create a dedicated feature branch named 'antigravity/<descriptive-task-name>' from the base branch.\n" +
         "3. Make all implementation changes only on that dedicated feature branch.\n" +
         "4. 'push_files' must target that dedicated feature branch ('antigravity/<descriptive-task-name>'). Never push directly to the base branch.\n" +
-        `5. 'create_pull_request' must use that feature branch as 'head' and ${explicitBase} as 'base'.\n` +
+        `5. 'create_pull_request' with 'draft: true' must use that feature branch as 'head' and ${explicitBase} as 'base'.\n` +
         "6. Run relevant tests and report their actual results.\n" +
         "7. Return the branch, commit SHA, PR URL, and test results.\n" +
         "Safety Restrictions:\n" +
