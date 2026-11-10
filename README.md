@@ -220,6 +220,20 @@ Run the test suite using Vitest:
 npm test
 ```
 
+#### Running Optional Gated Live Integration Tests
+
+The test suite includes gated live integration tests that test the live pathway (`Cloudflare Worker -> Google Interactions API -> Antigravity -> GitHub remote MCP -> GitHub`). These tests are disabled by default.
+
+To run the live GitHub MCP integration test against an external environment:
+
+```bash
+RUN_LIVE_GITHUB_MCP_TESTS=true \
+GEMINI_API_KEY="your-gemini-api-key" \
+GITHUB_MCP_READ_CREDENTIAL_ID="your-read-credential-id" \
+LIVE_TEST_GITHUB_REPO="octocat/Hello-World" \
+npm test
+```
+
 ### TypeScript Validation
 
 Ensure all TypeScript types compile without errors:
@@ -304,13 +318,16 @@ Executes autonomous multi-step reasoning, test suites, or file transformations i
 
 **Implementation Task Workflow**:
 When `mode: "implement"` is specified, Antigravity follows a strictly defined lifecycle:
-1. Inspects the repository and requested base branch.
-2. Creates a feature branch named `antigravity/<descriptive-task-name>`.
+1. Determines the base branch from `baseBranch` or uses the repository default branch if omitted.
+2. Creates a dedicated feature branch named `antigravity/<descriptive-task-name>`.
 3. Makes changes strictly on that feature branch.
-4. Executes tests and reports actual results.
-5. Pushes changes via `push_files`.
-6. Opens a draft pull request against the requested base branch (or default branch).
-7. Returns branch name, commit SHA, PR URL, and test results.
+4. `push_files` must target that feature branch. Never pushes directly to the base branch.
+5. `create_pull_request` uses that feature branch as `head` and the specified `baseBranch` (or default branch) as `base`.
+6. Runs relevant tests and reports their actual results.
+7. Opens a draft pull request and returns branch name, commit SHA, PR URL, and test results.
+8. Safety restrictions: Never calls `merge_pull_request`. Never force-pushes.
+
+*Note on authorization boundary: Because Google Antigravity invokes GitHub remote MCP tools directly without the Cloudflare Worker intercepting individual MCP tool arguments, the Worker cannot programmatically enforce the target branch string in `push_files`. GitHub branch protection rules or repository rulesets remain the mandatory authorization boundary preventing direct writes to default and protected branches.*
 
 **Output:**
 
