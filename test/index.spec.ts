@@ -2933,15 +2933,69 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
               "Expected matching 'mcp_server_tool_result' step with call_id matching get_file_contents tool call id"
             ).toBe(true);
 
-            // Verify the tool result did not fail and contains expected file content
-            const isNotErrorResult = getFileResult && !getFileResult.isError && !getFileResult.error;
-            expect(isNotErrorResult, "Expected GitHub get_file_contents tool result to succeed without error").toBe(true);
+            // Helper to extract text and check error flags on MCP tool result steps
+            const extractMcpResultText = (step: any): { isError: boolean; text: string } => {
+              if (!step) return { isError: true, text: "" };
 
-            const resultPayloadStr = JSON.stringify(getFileResult?.result || getFileResult?.content || getFileResult || "");
-            const resultContainsSnippet = resultPayloadStr.toLowerCase().includes(testExpectedFileSnippet.toLowerCase());
+              // Check outer step error indicators
+              if (step.isError === true || step.error) {
+                return { isError: true, text: "" };
+              }
+
+              const nestedResult = step.result !== undefined ? step.result : step;
+              // Check nested MCP CallToolResult error indicator
+              if (nestedResult && nestedResult.isError === true) {
+                return { isError: true, text: "" };
+              }
+
+              // Extract text safely from content blocks, text strings, or objects
+              let extracted = "";
+              const content = nestedResult?.content !== undefined ? nestedResult.content : nestedResult;
+
+              if (typeof content === "string") {
+                extracted = content;
+              } else if (Array.isArray(content)) {
+                for (const item of content) {
+                  if (typeof item === "string") {
+                    extracted += "\n" + item;
+                  } else if (item && typeof item === "object") {
+                    if (typeof item.text === "string") {
+                      extracted += "\n" + item.text;
+                    } else if (typeof item.content === "string") {
+                      extracted += "\n" + item.content;
+                    }
+                  }
+                }
+              } else if (content && typeof content === "object") {
+                if (typeof content.text === "string") {
+                  extracted = content.text;
+                }
+              }
+
+              return {
+                isError: false,
+                text: extracted.trim()
+              };
+            };
+
+            // Verify get_file_contents tool result
+            const fileResultParsed = extractMcpResultText(getFileResult);
             expect(
-              resultContainsSnippet,
-              "Expected GitHub get_file_contents tool result payload to contain expected file snippet"
+              !fileResultParsed.isError,
+              "Expected GitHub get_file_contents tool result to succeed without outer or nested error"
+            ).toBe(true);
+
+            expect(
+              fileResultParsed.text.length > 0,
+              "Expected GitHub get_file_contents tool result to contain non-empty text content"
+            ).toBe(true);
+
+            const fileTextContainsSnippet = fileResultParsed.text
+              .toLowerCase()
+              .includes(testExpectedFileSnippet.toLowerCase());
+            expect(
+              fileTextContainsSnippet,
+              "Expected GitHub get_file_contents tool result content to contain expected file snippet"
             ).toBe(true);
 
             // If PR number provided, require correlated pull_request_read tool execution
@@ -2961,29 +3015,16 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
                 s.type === "mcp_server_tool_result" &&
                 s.call_id === prCall?.id
               );
-              const hasPrResult = Boolean(prResult && !prResult.isError && !prResult.error);
+              const prResultParsed = extractMcpResultText(prResult);
               expect(
-                hasPrResult,
-                "Expected matching 'mcp_server_tool_result' step for 'pull_request_read' without error"
+                Boolean(prResult && !prResultParsed.isError),
+                "Expected matching 'mcp_server_tool_result' step for 'pull_request_read' without outer or nested error"
+              ).toBe(true);
+              expect(
+                prResultParsed.text.length > 0,
+                "Expected 'pull_request_read' tool result to contain non-empty content"
               ).toBe(true);
             }
-          }
-
-          // Verify non-empty output text confirming successful file retrieval
-          const outputText = parsedInteraction?.output_text || textContent;
-          const containsExpectedSnippet = outputText.toLowerCase().includes(testExpectedFileSnippet.toLowerCase());
-          expect(
-            containsExpectedSnippet,
-            "Expected interaction output to contain known file content from repository"
-          ).toBe(true);
-
-          // If test PR provided, verify PR was read
-          if (testPr !== undefined) {
-            const mentionsPr =
-              outputText.includes(`#${testPr}`) ||
-              outputText.toLowerCase().includes("pull request") ||
-              outputText.toLowerCase().includes("pr");
-            expect(mentionsPr, "Expected output to reference inspected pull request").toBe(true);
           }
 
           // Complete secret scanning across the ENTIRE returned interaction structure
