@@ -26,6 +26,7 @@ import worker, {
   GITHUB_MCP_READ_TOOLS,
   GITHUB_MCP_IMPLEMENT_TOOLS,
   resetPassphraseThrottle,
+  recordPassphraseFailure,
   PASSPHRASE_MAX_FAILURES
 } from "../src/index";
 import {
@@ -3383,6 +3384,53 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       });
       expect(deny.status).toBe(302);
       expect(deny.headers.get("Location")).not.toContain(ownerPassphrase);
+    });
+  });
+
+  describe("13. Passphrase throttle fails closed when the coordinator is unavailable", () => {
+    it("locks out when the coordinator stub is missing", async () => {
+      const noCoordEnv = { ...env, CONSENT_COORDINATOR: undefined } as any;
+
+      const result = await recordPassphraseFailure(noCoordEnv);
+
+      expect(result.locked).toBe(true);
+      expect(result.failures).toBeGreaterThan(PASSPHRASE_MAX_FAILURES);
+    });
+
+    it("locks out when the coordinator returns a non-ok response", async () => {
+      const nonOkEnv = {
+        ...env,
+        CONSENT_COORDINATOR: {
+          idFromName: () => "passphrase-throttle-id",
+          get: () => ({
+            fetch: async () => new Response("unavailable", { status: 503 })
+          })
+        }
+      } as any;
+
+      const result = await recordPassphraseFailure(nonOkEnv);
+
+      expect(result.locked).toBe(true);
+      expect(result.failures).toBeGreaterThan(PASSPHRASE_MAX_FAILURES);
+    });
+
+    it("locks out when the coordinator fetch throws", async () => {
+      const throwingEnv = {
+        ...env,
+        CONSENT_COORDINATOR: {
+          idFromName: () => "passphrase-throttle-id",
+          get: () => ({
+            fetch: async () => {
+              throw new Error("coordinator unavailable");
+            }
+          })
+        }
+      } as any;
+
+      const result = await recordPassphraseFailure(throwingEnv);
+
+      expect(result.locked).toBe(true);
+      expect(result.failures).toBeGreaterThan(PASSPHRASE_MAX_FAILURES);
     });
   });
 });

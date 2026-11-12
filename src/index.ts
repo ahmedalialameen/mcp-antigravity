@@ -1398,12 +1398,12 @@ export async function recordPassphraseFailure(
 ): Promise<{ locked: boolean; failures: number }> {
   try {
     const stub = getPassphraseThrottleStub(env);
-    if (!stub) return { locked: false, failures: 0 };
+    if (!stub) return { locked: true, failures: PASSPHRASE_MAX_FAILURES + 1 };
     const res = await stub.fetch("https://coordinator/passphrase/failure", { method: "POST" });
-    if (!res.ok) return { locked: false, failures: 0 };
+    if (!res.ok) return { locked: true, failures: PASSPHRASE_MAX_FAILURES + 1 };
     return (await res.json()) as { locked: boolean; failures: number };
   } catch {
-    return { locked: false, failures: 0 };
+    return { locked: true, failures: PASSPHRASE_MAX_FAILURES + 1 };
   }
 }
 
