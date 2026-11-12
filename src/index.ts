@@ -11,6 +11,7 @@ export interface Env {
   MCP_RESOURCE: string;
   ALLOWED_USERS?: string;
   AUTH_SECRET?: string;
+  OWNER_PASSPHRASE?: string;
   CF_ACCESS_TEAM_DOMAIN?: string;
   CF_ACCESS_AUD?: string;
   CF_ACCESS_JWKS_JSON?: string;
@@ -101,6 +102,58 @@ export function escapeHtml(str: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+export const OWNER_PASSPHRASE_MIN_LENGTH = 24;
+
+export interface OwnerPassphraseConfig {
+  ownerId: string;
+  passphrase: string;
+}
+
+/**
+ * Returns the single-owner passphrase configuration, or null when not configured.
+ * Fails closed unless the passphrase is long enough and the first ALLOWED_USERS
+ * entry is a concrete, non-wildcard identity.
+ */
+export function getOwnerPassphraseConfig(env: Env): OwnerPassphraseConfig | null {
+  const passphrase = env.OWNER_PASSPHRASE;
+  if (typeof passphrase !== "string" || passphrase.trim().length < OWNER_PASSPHRASE_MIN_LENGTH) {
+    return null;
+  }
+
+  const ownerId = (env.ALLOWED_USERS || "").split(",")[0]?.trim().toLowerCase() || "";
+  if (!ownerId || ownerId === "*") {
+    return null;
+  }
+
+  return { ownerId, passphrase: passphrase.trim() };
+}
+
+/**
+ * Compares SHA-256 digests of two passphrases in constant time.
+ */
+export async function verifyOwnerPassphrase(
+  submitted: string | null | undefined,
+  configured: string
+): Promise<boolean> {
+  if (typeof submitted !== "string" || typeof configured !== "string") {
+    return false;
+  }
+
+  const normalizedSubmitted = submitted.trim();
+  const normalizedConfigured = configured.trim();
+  if (normalizedSubmitted.length === 0 || normalizedConfigured.length === 0) {
+    return false;
+  }
+
+  const encoder = new TextEncoder();
+  const [submittedDigest, configuredDigest] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(normalizedSubmitted)),
+    crypto.subtle.digest("SHA-256", encoder.encode(normalizedConfigured))
+  ]);
+
+  return crypto.subtle.timingSafeEqual(submittedDigest, configuredDigest);
 }
 
 /**
@@ -1043,6 +1096,9 @@ export async function authenticateAndAuthorizeUser(
  * and schedules alarms for automatic periodic cleanup.
  */
 export const CSRF_NONCE_RETENTION_MS = 15 * 60 * 1000; // 15 minutes
+export const PASSPHRASE_MAX_FAILURES = 5;
+export const PASSPHRASE_FAILURE_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+export const PASSPHRASE_THROTTLE_SHARD = "owner-passphrase-throttle";
 
 export class ConsentCoordinatorDO {
   private sql: SqlStorage;
@@ -1055,10 +1111,100 @@ export class ConsentCoordinatorDO {
         consumed_at INTEGER NOT NULL
       );
     `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS passphrase_throttle (
+        id INTEGER PRIMARY KEY,
+        failures INTEGER NOT NULL,
+        window_start INTEGER NOT NULL
+      );
+    `);
+  }
+
+  private getPassphraseThrottle(): { failures: number; windowStart: number } {
+    const rows = this.sql
+      .exec("SELECT failures, window_start FROM passphrase_throttle WHERE id = 1")
+      .toArray();
+    if (rows.length === 0) {
+      return { failures: 0, windowStart: 0 };
+    }
+    return {
+      failures: Number(rows[0].failures),
+      windowStart: Number(rows[0].window_start)
+    };
+  }
+
+  private setPassphraseThrottle(failures: number, windowStart: number): void {
+    this.sql.exec("DELETE FROM passphrase_throttle WHERE id = 1");
+    this.sql.exec(
+      "INSERT INTO passphrase_throttle (id, failures, window_start) VALUES (1, ?, ?)",
+      failures,
+      windowStart
+    );
+  }
+
+  private normalizePassphraseThrottle(now: number): { failures: number; windowStart: number } {
+    const state = this.getPassphraseThrottle();
+    if (state.failures > 0 && now - state.windowStart >= PASSPHRASE_FAILURE_WINDOW_MS) {
+      this.setPassphraseThrottle(0, 0);
+      return { failures: 0, windowStart: 0 };
+    }
+    return state;
+  }
+
+  isPassphraseLocked(now = Date.now()): boolean {
+    return this.state.storage.transactionSync(() => {
+      return this.normalizePassphraseThrottle(now).failures >= PASSPHRASE_MAX_FAILURES;
+    });
+  }
+
+  recordPassphraseFailure(now = Date.now()): { locked: boolean; failures: number } {
+    return this.state.storage.transactionSync(() => {
+      const current = this.normalizePassphraseThrottle(now);
+      const failures = current.failures + 1;
+      const windowStart = current.failures === 0 ? now : current.windowStart;
+      this.setPassphraseThrottle(failures, windowStart);
+      return { locked: failures >= PASSPHRASE_MAX_FAILURES, failures };
+    });
+  }
+
+  resetPassphraseFailures(): void {
+    this.state.storage.transactionSync(() => {
+      this.setPassphraseThrottle(0, 0);
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    if (
+      url.pathname === "/passphrase/locked" ||
+      url.pathname === "/passphrase/failure" ||
+      url.pathname === "/passphrase/reset"
+    ) {
+      if (request.method !== "POST") {
+        return new Response("Method not allowed", { status: 405 });
+      }
+
+      if (url.pathname === "/passphrase/locked") {
+        return new Response(JSON.stringify({ locked: this.isPassphraseLocked() }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      if (url.pathname === "/passphrase/failure") {
+        return new Response(JSON.stringify(this.recordPassphraseFailure()), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      this.resetPassphraseFailures();
+      return new Response(JSON.stringify({ reset: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
 
     // Accept only POST /consume
     if (url.pathname !== "/consume") {
@@ -1219,6 +1365,61 @@ export async function consumeNonceAtomically(
   }
 }
 
+function getPassphraseThrottleStub(env: Env): DurableObjectStub | null {
+  if (!env?.CONSENT_COORDINATOR) {
+    return null;
+  }
+  const id = env.CONSENT_COORDINATOR.idFromName(PASSPHRASE_THROTTLE_SHARD);
+  return env.CONSENT_COORDINATOR.get(id);
+}
+
+/**
+ * Returns whether passphrase attempts are currently locked. Fails closed if
+ * the coordinator binding is unavailable.
+ */
+export async function isPassphraseThrottleLocked(env: Env): Promise<boolean> {
+  try {
+    const stub = getPassphraseThrottleStub(env);
+    if (!stub) return true;
+    const res = await stub.fetch("https://coordinator/passphrase/locked", { method: "POST" });
+    if (!res.ok) return true;
+    const body = (await res.json()) as { locked?: boolean };
+    return body.locked !== false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Records a failed passphrase attempt in the global owner throttle.
+ */
+export async function recordPassphraseFailure(
+  env: Env
+): Promise<{ locked: boolean; failures: number }> {
+  try {
+    const stub = getPassphraseThrottleStub(env);
+    if (!stub) return { locked: true, failures: PASSPHRASE_MAX_FAILURES + 1 };
+    const res = await stub.fetch("https://coordinator/passphrase/failure", { method: "POST" });
+    if (!res.ok) return { locked: true, failures: PASSPHRASE_MAX_FAILURES + 1 };
+    return (await res.json()) as { locked: boolean; failures: number };
+  } catch {
+    return { locked: true, failures: PASSPHRASE_MAX_FAILURES + 1 };
+  }
+}
+
+/**
+ * Resets the global owner passphrase failure counter after a successful login.
+ */
+export async function resetPassphraseThrottle(env: Env): Promise<void> {
+  try {
+    const stub = getPassphraseThrottleStub(env);
+    if (!stub) return;
+    await stub.fetch("https://coordinator/passphrase/reset", { method: "POST" });
+  } catch {
+    // Failure to reset must not grant access or leak details.
+  }
+}
+
 /**
  * Verifies a consent CSRF token and atomically consumes its nonce.
  */
@@ -1324,8 +1525,33 @@ export const oauth = new OAuthProvider({
           return new Response("OAuth provider not initialized", { status: 500 });
         }
 
-        const authResult = await authenticateAndAuthorizeUser(request, env);
-        if (!authResult.authorized || !authResult.userId) {
+        const passphraseConfig = getOwnerPassphraseConfig(env);
+        const usePassphraseMode =
+          !request.headers.has("Cf-Access-Jwt-Assertion") &&
+          !env.AUTH_SECRET &&
+          passphraseConfig !== null;
+
+        let authResult: { authorized: boolean; userId?: string; error?: string };
+        if (usePassphraseMode && passphraseConfig) {
+          authResult = { authorized: true, userId: passphraseConfig.ownerId };
+        } else {
+          authResult = await authenticateAndAuthorizeUser(request, env);
+          if (!authResult.authorized || !authResult.userId) {
+            return new Response(
+              JSON.stringify({
+                error: "access_denied",
+                error_description: authResult.error || "User authentication and authorization required"
+              }),
+              {
+                status: 403,
+                headers: { "Content-Type": "application/json" }
+              }
+            );
+          }
+        }
+
+        const authenticatedUserId = authResult.userId;
+        if (!authenticatedUserId) {
           return new Response(
             JSON.stringify({
               error: "access_denied",
@@ -1429,7 +1655,7 @@ export const oauth = new OAuthProvider({
               csrfToken,
               authRequest.clientId,
               authRequest.redirectUri,
-              authResult.userId,
+              authenticatedUserId,
               authRequest.codeChallenge || "",
               csrfSecret,
               env
@@ -1454,9 +1680,40 @@ export const oauth = new OAuthProvider({
             }
 
             if (action === "approve") {
+              if (usePassphraseMode && passphraseConfig) {
+                const attempt = await recordPassphraseFailure(env);
+                if (attempt.failures > PASSPHRASE_MAX_FAILURES) {
+                  return new Response(
+                    JSON.stringify({
+                      error: "access_denied",
+                      error_description: "Too many failed attempts. Try again later."
+                    }),
+                    { status: 429, headers: { "Content-Type": "application/json" } }
+                  );
+                }
+
+                const submittedPassphrase = formData.get("owner_passphrase");
+                const passphraseValid = await verifyOwnerPassphrase(
+                  typeof submittedPassphrase === "string" ? submittedPassphrase : null,
+                  passphraseConfig.passphrase
+                );
+
+                if (!passphraseValid) {
+                  return new Response(
+                    JSON.stringify({
+                      error: "access_denied",
+                      error_description: "Incorrect passphrase."
+                    }),
+                    { status: 403, headers: { "Content-Type": "application/json" } }
+                  );
+                }
+
+                await resetPassphraseThrottle(env);
+              }
+
               const { redirectTo } = await oauthHelpers.completeAuthorization({
                 request: authRequest,
-                userId: authResult.userId,
+                userId: authenticatedUserId,
                 scope: requestedScopes
               });
               return Response.redirect(redirectTo, 302);
@@ -1464,10 +1721,10 @@ export const oauth = new OAuthProvider({
           }
 
           // If client is pre-trusted and no interactive consent required
-          if (isPreTrusted) {
+          if (isPreTrusted && !usePassphraseMode) {
             const { redirectTo } = await oauthHelpers.completeAuthorization({
               request: authRequest,
-              userId: authResult.userId,
+              userId: authenticatedUserId,
               scope: requestedScopes
             });
             return Response.redirect(redirectTo, 302);
@@ -1489,14 +1746,14 @@ export const oauth = new OAuthProvider({
           const csrfToken = await createConsentCsrfToken(
             authRequest.clientId,
             authRequest.redirectUri,
-            authResult.userId,
+            authenticatedUserId,
             authRequest.codeChallenge || "",
             csrfSecret
           );
 
           // Context-appropriate escaping for all untrusted values
           const safeClientName = escapeHtml(clientName);
-          const safeUserId = escapeHtml(authResult.userId);
+          const safeUserId = escapeHtml(authenticatedUserId);
           const safeScopes = escapeHtml(requestedScopes.join(", "));
           const safeResource = escapeHtml(canonicalResource);
           const safeCsrfToken = escapeHtml(csrfToken);
@@ -1523,15 +1780,19 @@ export const oauth = new OAuthProvider({
 <body>
   <div class="card">
     <h2>Authorize Application</h2>
-    <p><strong>${safeUserId}</strong>, do you authorize <strong>${safeClientName}</strong> to access the Antigravity MCP Server?</p>
+    <p>${usePassphraseMode ? "" : `<strong>${safeUserId}</strong>, `}do you authorize <strong>${safeClientName}</strong> to access the Antigravity MCP Server?</p>
     <p>Requested Scopes:</p>
     <div class="scopes">${safeScopes}</div>
     <p><small>Resource: ${safeResource}</small></p>
     <form method="POST" action="${safeAction}">
       <input type="hidden" name="csrf_token" value="${safeCsrfToken}" />
+      ${usePassphraseMode ? `<p>
+        <label for="owner_passphrase">Owner passphrase</label><br />
+        <input type="password" id="owner_passphrase" name="owner_passphrase" autocomplete="current-password" required />
+      </p>` : ""}
       <div class="buttons">
         <button type="submit" name="consent_action" value="approve" class="btn approve">Approve</button>
-        <button type="submit" name="consent_action" value="deny" class="btn deny">Deny</button>
+        <button type="submit" name="consent_action" value="deny" formnovalidate class="btn deny">Deny</button>
       </div>
     </form>
   </div>
