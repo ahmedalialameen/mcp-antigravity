@@ -83,7 +83,9 @@ wrangler secret put CONSENT_CSRF_SECRET
 
 #### B. Identity Authentication Method
 
-- **Method 1: Cloudflare Access JWT (Preferred)**
+Cloudflare Access is optional, not required. Configure one of the methods below.
+
+- **Method 1: Cloudflare Access JWT (Optional)**
   Protect your Worker behind Cloudflare Access. The server validates RS256 assertions (`Cf-Access-Jwt-Assertion`) using bounded cached JWKS with fail-closed claim verification:
   - Set `CF_ACCESS_TEAM_DOMAIN` (e.g. `"my-team"` which resolves JWKS from `https://my-team.cloudflareaccess.com/cdn-cgi/access/certs`).
   - Set `CF_ACCESS_AUD` to your Cloudflare Access Application Audience Tag. (Fails closed if missing or mismatched).
@@ -94,6 +96,13 @@ wrangler secret put CONSENT_CSRF_SECRET
   wrangler secret put AUTH_SECRET
   ```
   The proxy must provide `X-Auth-User` and `X-Auth-Signature` (HMAC-SHA256 of the user email). `AUTH_SECRET` is dedicated strictly to HMAC proxy authentication and is never used as a CSRF fallback.
+
+- **Method 3: Owner Passphrase (No Cloudflare Access Required)**
+  Set a single-owner passphrase to log in directly on the OAuth consent page:
+  ```bash
+  wrangler secret put OWNER_PASSPHRASE
+  ```
+  Generate at least 40 random characters and set it only in the Cloudflare dashboard as a secret. Passphrase mode is enabled only when `OWNER_PASSPHRASE` is at least 24 characters (after trimming) and the first entry of `ALLOWED_USERS` is a concrete, non-wildcard identity; that first entry becomes the owner id. After 5 failed attempts within 15 minutes, further passphrase submissions are rejected for 15 minutes.
 
 #### C. Google Antigravity Agent API Key (Required)
 Store your Google Gemini / Interactions API key:

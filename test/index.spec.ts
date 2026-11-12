@@ -24,7 +24,9 @@ import worker, {
   sanitizeSecret,
   GITHUB_MCP_REMOTE_URL,
   GITHUB_MCP_READ_TOOLS,
-  GITHUB_MCP_IMPLEMENT_TOOLS
+  GITHUB_MCP_IMPLEMENT_TOOLS,
+  resetPassphraseThrottle,
+  PASSPHRASE_MAX_FAILURES
 } from "../src/index";
 import {
   env,
@@ -3046,5 +3048,298 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       },
       360000 // 6-minute test timeout to cover initial request, bounded polling, and final response safely
     );
+  });
+
+  describe("12. Owner passphrase login for /oauth/authorize", () => {
+    const ownerPassphrase = "correct-horse-battery-staple-4f8b2c9e1a";
+    const ownerId = "owner@example.com";
+    const redirectUri = "https://example.com/passphrase-cb";
+
+    beforeEach(async () => {
+      await resetPassphraseThrottle(env as any);
+    });
+
+    async function registerClient(clientName = "Passphrase Client") {
+      const regReq = new Request("http://example.com/oauth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: clientName,
+          redirect_uris: [redirectUri],
+          token_endpoint_auth_method: "client_secret_post"
+        })
+      });
+      const ctx = createExecutionContext();
+      const regRes = await worker.fetch(regReq, env as any, ctx);
+      await waitOnExecutionContext(ctx);
+      return await regRes.json<any>();
+    }
+
+    async function makeCodeChallenge() {
+      const verifier = "abcdefghijklmnopqrstuvwxyz0123456789-._~ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      const enc = new TextEncoder();
+      const hash = await crypto.subtle.digest("SHA-256", enc.encode(verifier));
+      let bin = "";
+      const bytes = new Uint8Array(hash);
+      for (let i = 0; i < bytes.byteLength; i++) {
+        bin += String.fromCharCode(bytes[i]);
+      }
+      return btoa(bin).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+    }
+
+    async function buildAuthUrl(clientId: string, state = "passphrase-state") {
+      const codeChallenge = await makeCodeChallenge();
+      return `http://example.com/oauth/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&code_challenge=${codeChallenge}&code_challenge_method=S256&scope=mcp&state=${state}&resource=http://example.com/mcp`;
+    }
+
+    function passphraseEnv(overrides: Record<string, unknown> = {}) {
+      return {
+        ...env,
+        ALLOWED_USERS: ownerId,
+        OWNER_PASSPHRASE: ownerPassphrase,
+        CONSENT_CSRF_SECRET: "passphrase-consent-csrf-secret",
+        MCP_RESOURCE: "http://example.com/mcp",
+        ...overrides
+      } as any;
+    }
+
+    async function getConsent(url: string, testEnv: any) {
+      const req = new Request(url);
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(req, testEnv, ctx);
+      await waitOnExecutionContext(ctx);
+      return res;
+    }
+
+    async function getCsrf(url: string, testEnv: any) {
+      const res = await getConsent(url, testEnv);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      const match = html.match(/name="csrf_token"\s+value="([^"]+)"/);
+      expect(match).not.toBeNull();
+      return { html, csrfToken: match![1] };
+    }
+
+    async function postConsent(url: string, testEnv: any, fields: Record<string, string>) {
+      const form = new FormData();
+      for (const [key, value] of Object.entries(fields)) {
+        form.set(key, value);
+      }
+      const req = new Request(url, { method: "POST", body: form });
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(req, testEnv, ctx);
+      await waitOnExecutionContext(ctx);
+      return res;
+    }
+
+    async function submitAttempt(
+      clientId: string,
+      testEnv: any,
+      passphrase: string | undefined,
+      state = "passphrase-state"
+    ) {
+      const url = await buildAuthUrl(clientId, state);
+      const { csrfToken } = await getCsrf(url, testEnv);
+      const fields: Record<string, string> = {
+        consent_action: "approve",
+        csrf_token: csrfToken
+      };
+      if (passphrase !== undefined) {
+        fields.owner_passphrase = passphrase;
+      }
+      return postConsent(url, testEnv, fields);
+    }
+
+    it("fails closed with the existing 403 when passphrase mode is not configured", async () => {
+      const client = await registerClient("Passphrase Unconfigured Client");
+      const url = await buildAuthUrl(client.client_id);
+
+      const cases = [
+        passphraseEnv({ OWNER_PASSPHRASE: undefined }),
+        passphraseEnv({ OWNER_PASSPHRASE: "too-short" }),
+        passphraseEnv({ ALLOWED_USERS: "*" }),
+        passphraseEnv({ ALLOWED_USERS: "" })
+      ];
+
+      for (const testEnv of cases) {
+        const res = await getConsent(url, testEnv);
+        expect(res.status).toBe(403);
+        const body = await res.json<any>();
+        expect(body.error).toBe("access_denied");
+      }
+    });
+
+    it("shows the passphrase field on the consent page without any authentication headers", async () => {
+      const client = await registerClient("Passphrase Consent Client");
+      const url = await buildAuthUrl(client.client_id);
+      const { html } = await getCsrf(url, passphraseEnv());
+
+      expect(html).toContain('name="owner_passphrase"');
+      expect(html).toContain('type="password"');
+      expect(html).toContain('autocomplete="current-password"');
+      expect(html).toContain("Owner passphrase");
+      expect(html).toContain(ownerId);
+      expect(html).toContain('name="csrf_token"');
+    });
+
+    it("rejects a wrong passphrase with 403 and never issues an authorization code", async () => {
+      const client = await registerClient("Passphrase Wrong Client");
+      const res = await submitAttempt(client.client_id, passphraseEnv(), "definitely-the-wrong-passphrase");
+
+      expect(res.status).toBe(403);
+      const body = await res.json<any>();
+      expect(body.error).toBe("access_denied");
+      expect(body.error_description).toBe("Incorrect passphrase.");
+      expect(res.headers.get("Location")).toBeNull();
+    });
+
+    it("rejects a missing passphrase with 403", async () => {
+      const client = await registerClient("Passphrase Missing Client");
+      const res = await submitAttempt(client.client_id, passphraseEnv(), undefined);
+
+      expect(res.status).toBe(403);
+      const body = await res.json<any>();
+      expect(body.error).toBe("access_denied");
+      expect(body.error_description).toBe("Incorrect passphrase.");
+    });
+
+    it("redirects with an authorization code for the right passphrase", async () => {
+      const client = await registerClient("Passphrase Right Client");
+      const res = await submitAttempt(client.client_id, passphraseEnv(), ownerPassphrase, "right-passphrase-state");
+
+      expect(res.status).toBe(302);
+      const location = res.headers.get("Location");
+      expect(location).not.toBeNull();
+      const redirectUrl = new URL(location!);
+      expect(redirectUrl.searchParams.get("code")).toBeTruthy();
+      expect(redirectUrl.searchParams.get("state")).toBe("right-passphrase-state");
+      expect(redirectUrl.searchParams.get("error")).toBeNull();
+    });
+
+    it("does not auto-approve trusted client IDs in passphrase mode", async () => {
+      const client = await registerClient("Passphrase Trusted Client");
+      const testEnv = passphraseEnv({ TRUSTED_CLIENT_IDS: client.client_id });
+      const url = await buildAuthUrl(client.client_id);
+
+      const res = await getConsent(url, testEnv);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('name="owner_passphrase"');
+    });
+
+    it("allows deny without a passphrase", async () => {
+      const client = await registerClient("Passphrase Deny Client");
+      const url = await buildAuthUrl(client.client_id, "deny-state");
+      const { csrfToken } = await getCsrf(url, passphraseEnv());
+
+      const res = await postConsent(url, passphraseEnv(), {
+        consent_action: "deny",
+        csrf_token: csrfToken
+      });
+
+      expect(res.status).toBe(302);
+      const redirectUrl = new URL(res.headers.get("Location")!);
+      expect(redirectUrl.searchParams.get("error")).toBe("access_denied");
+      expect(redirectUrl.searchParams.get("error_description")).toBe("User denied authorization");
+      expect(redirectUrl.searchParams.get("state")).toBe("deny-state");
+      expect(redirectUrl.searchParams.get("code")).toBeNull();
+    });
+
+    it("locks after 5 failures and rejects a 6th attempt even with the right passphrase", async () => {
+      const client = await registerClient("Passphrase Lock Client");
+      const testEnv = passphraseEnv();
+
+      for (let i = 0; i < PASSPHRASE_MAX_FAILURES; i++) {
+        const res = await submitAttempt(client.client_id, testEnv, `wrong-passphrase-${i}`);
+        expect(res.status).toBe(403);
+      }
+
+      const lockedRes = await submitAttempt(client.client_id, testEnv, ownerPassphrase);
+      expect(lockedRes.status).toBe(429);
+      const body = await lockedRes.json<any>();
+      expect(body.error).toBe("access_denied");
+      expect(body.error_description).toBe("Too many failed attempts. Try again later.");
+    });
+
+    it("resets the failure counter after a successful passphrase login", async () => {
+      const client = await registerClient("Passphrase Reset Client");
+      const testEnv = passphraseEnv();
+
+      for (let i = 0; i < PASSPHRASE_MAX_FAILURES - 1; i++) {
+        const res = await submitAttempt(client.client_id, testEnv, `wrong-before-reset-${i}`);
+        expect(res.status).toBe(403);
+      }
+
+      const success = await submitAttempt(client.client_id, testEnv, ownerPassphrase);
+      expect(success.status).toBe(302);
+
+      for (let i = 0; i < PASSPHRASE_MAX_FAILURES - 1; i++) {
+        const res = await submitAttempt(client.client_id, testEnv, `wrong-after-reset-${i}`);
+        expect(res.status).toBe(403);
+      }
+
+      const secondSuccess = await submitAttempt(client.client_id, testEnv, ownerPassphrase);
+      expect(secondSuccess.status).toBe(302);
+    });
+
+    it("rejects reuse of a consent CSRF token in passphrase mode", async () => {
+      const client = await registerClient("Passphrase CSRF Reuse Client");
+      const testEnv = passphraseEnv();
+      const url = await buildAuthUrl(client.client_id, "csrf-reuse-state");
+      const { csrfToken } = await getCsrf(url, testEnv);
+
+      const first = await postConsent(url, testEnv, {
+        consent_action: "approve",
+        csrf_token: csrfToken,
+        owner_passphrase: "wrong-csrf-reuse-passphrase"
+      });
+      expect(first.status).toBe(403);
+
+      const replay = await postConsent(url, testEnv, {
+        consent_action: "approve",
+        csrf_token: csrfToken,
+        owner_passphrase: ownerPassphrase
+      });
+      expect(replay.status).toBe(400);
+      const body = await replay.json<any>();
+      expect(body.error).toBe("invalid_request");
+      expect(body.error_description).toContain("already used CSRF token");
+    });
+
+    it("never includes the configured passphrase in any response or error", async () => {
+      const client = await registerClient("Passphrase Hygiene Client");
+      const testEnv = passphraseEnv();
+      const url = await buildAuthUrl(client.client_id, "hygiene-state");
+
+      const { html, csrfToken } = await getCsrf(url, testEnv);
+      expect(html).not.toContain(ownerPassphrase);
+
+      const wrong = await postConsent(url, testEnv, {
+        consent_action: "approve",
+        csrf_token: csrfToken,
+        owner_passphrase: "wrong-hygiene-passphrase"
+      });
+      expect(wrong.status).toBe(403);
+      expect(await wrong.text()).not.toContain(ownerPassphrase);
+
+      const successUrl = await buildAuthUrl(client.client_id, "hygiene-success-state");
+      const { csrfToken: successToken } = await getCsrf(successUrl, testEnv);
+      const success = await postConsent(successUrl, testEnv, {
+        consent_action: "approve",
+        csrf_token: successToken,
+        owner_passphrase: ownerPassphrase
+      });
+      expect(success.status).toBe(302);
+      expect(success.headers.get("Location")).not.toContain(ownerPassphrase);
+
+      const denyUrl = await buildAuthUrl(client.client_id, "hygiene-deny-state");
+      const { csrfToken: denyToken } = await getCsrf(denyUrl, testEnv);
+      const deny = await postConsent(denyUrl, testEnv, {
+        consent_action: "deny",
+        csrf_token: denyToken
+      });
+      expect(deny.status).toBe(302);
+      expect(deny.headers.get("Location")).not.toContain(ownerPassphrase);
+    });
   });
 });
