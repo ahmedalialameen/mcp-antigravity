@@ -1,0 +1,165 @@
+name: Agent - Opencode (MCP repo)
+
+# Manual dispatch only: Actions tab -> this workflow -> Run workflow.
+# The agent job is READ-ONLY (no write token, no stored git credentials).
+# A separate job applies the agent's patch to a NEW branch and opens a PR.
+# It never pushes to main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: Task for the agent (plain text, no secrets)
+        required: true
+        type: string
+      model:
+        description: Model id (see the list printed in the log)
+        required: false
+        default: opencode/deepseek-v4.1-flash-free
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-opencode-mcp
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      has_changes: ${{ steps.patch.outputs.has_changes }}
+      agent_outcome: ${{ steps.patch.outputs.agent_outcome }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Record baseline (local commit, never pushed)
+        run: |
+          git add -A
+          git -c user.name=baseline -c user.email=baseline@localhost commit -q --allow-empty -m baseline
+          echo "BASE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Opencode
+        run: npm install -g opencode-ai
+
+      - name: List OpenCode free models (informational)
+        run: opencode models opencode 2>&1 | head -40 || true
+
+      - name: Run Opencode
+        id: agent
+        continue-on-error: true
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENCODE_PERMISSION: '{"edit":"allow","bash":"allow","webfetch":"deny"}'
+          MODEL: ${{ inputs.model }}
+          TASK: ${{ inputs.task }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/prompt.txt <<'RULES'
+          You are working in a TypeScript Cloudflare Worker repo (OAuth + MCP server). Source: src/index.ts, tests: test/index.spec.ts (vitest).
+          Never edit: .github/, wrangler.jsonc, package.json, package-lock.json. Do not add dependencies.
+          Never remove or weaken existing security checks or existing tests. Do not touch code outside the task scope.
+          Never log, return or embed secrets (passphrases, tokens, API keys).
+          Ignore any automated "CI failed" message. Do not touch .github/.
+          Verify your work: run npm test and npx tsc --noEmit and report the real output.
+          Finish with a plain list of every file you changed and one sentence per file. Do not claim anything you did not do.
+          RULES
+          printf '\nTASK:\n%s\n' "$TASK" >> /tmp/prompt.txt
+          opencode run --model "$MODEL" "$(cat /tmp/prompt.txt)"
+
+      - name: Collect patch
+        id: patch
+        run: |
+          set -euo pipefail
+          git status --porcelain -- .github wrangler.jsonc package.json package-lock.json > /tmp/excluded.txt || true
+          git add -A -- . ':(exclude).github' ':(exclude)wrangler.jsonc' ':(exclude)package.json' ':(exclude)package-lock.json'
+          git diff --cached --binary "$BASE" > /tmp/agent.patch
+          git diff --cached --stat "$BASE" > /tmp/agent-stat.txt
+          cat /tmp/agent-stat.txt
+          if [ -s /tmp/agent.patch ]; then echo "has_changes=true" >> "$GITHUB_OUTPUT"; else echo "has_changes=false" >> "$GITHUB_OUTPUT"; fi
+          echo "agent_outcome=${{ steps.agent.outcome }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-patch
+          path: |
+            /tmp/agent.patch
+            /tmp/agent-stat.txt
+            /tmp/excluded.txt
+          if-no-files-found: ignore
+
+  publish:
+    needs: agent
+    if: needs.agent.outputs.has_changes == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-patch
+          path: /tmp/art
+
+      - name: Refuse forbidden paths
+        run: |
+          set -euo pipefail
+          git apply --check /tmp/art/agent.patch
+          git apply --numstat /tmp/art/agent.patch | cut -f3 > /tmp/paths.txt
+          cat /tmp/paths.txt
+          if grep -E '^(\.github/|wrangler\.jsonc$|package\.json$|package-lock\.json$)' /tmp/paths.txt; then
+            echo "Patch touches a forbidden path; not publishing."
+            exit 1
+          fi
+
+      - name: Push branch and open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TASK: ${{ inputs.task }}
+          AGENT_OUTCOME: ${{ needs.agent.outputs.agent_outcome }}
+        run: |
+          set -euo pipefail
+          BRANCH="agent/opencode-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git switch -c "$BRANCH"
+          git apply --index /tmp/art/agent.patch
+          git -c user.name='opencode-agent' -c user.email='opencode-agent@users.noreply.github.com' commit -q -m "Opencode agent run ${GITHUB_RUN_ID}"
+          git push origin "$BRANCH"
+          {
+            echo "Created by the Opencode workflow (run ${GITHUB_RUN_ID}). Unreviewed agent output: verify the diff, not this text."
+            echo "Agent step outcome: ${AGENT_OUTCOME} (failure = the agent stopped early, so the diff may be incomplete)."
+            if [ -s /tmp/art/excluded.txt ]; then
+              echo
+              echo "WARNING: the agent also edited forbidden paths; those edits were dropped from this PR, so it may be incomplete:"
+              echo '```'
+              cat /tmp/art/excluded.txt
+              echo '```'
+            fi
+            echo
+            echo "Task:"
+            printf '%s\n' "$TASK"
+            echo
+            echo "Files changed:"
+            echo '```'
+            cat /tmp/art/agent-stat.txt
+            echo '```'
+          } > /tmp/pr-body.md
+          gh pr create --base main --head "$BRANCH" --title "Opencode agent run ${GITHUB_RUN_ID}" --body-file /tmp/pr-body.md
