@@ -345,3 +345,5 @@ When `mode: "implement"` is specified, Antigravity follows a strictly defined li
 **Output:**
 
 Returns the structured JSON response or an MCP error block (`isError: true`) if the API request fails.
+
+Deployed with Cloudflare Workers Builds.
