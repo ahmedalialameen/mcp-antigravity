@@ -1,0 +1,34 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "antigravity-mcp-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "74c02cc58ba7467da96c001f1f6757bb"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONSENT_COORDINATOR",
+        "class_name": "ConsentCoordinatorDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ConsentCoordinatorDO"]
+    }
+  ],
+  "vars": {
+    "MCP_RESOURCE": "https://antigravity-mcp-server.ahmedalameen93.workers.dev/mcp",
+    "ALLOWED_USERS": "ahmedalameen93@hotmail.com"
+  }
+}
