@@ -3178,8 +3178,16 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(html).toContain('type="password"');
       expect(html).toContain('autocomplete="current-password"');
       expect(html).toContain("Owner passphrase");
-      expect(html).toContain(ownerId);
+      expect(html).not.toContain(ownerId);
       expect(html).toContain('name="csrf_token"');
+    });
+
+    it("renders formnovalidate on the Deny button so denying does not require a passphrase", async () => {
+      const client = await registerClient("Passphrase Deny Validation Client");
+      const url = await buildAuthUrl(client.client_id);
+      const { html } = await getCsrf(url, passphraseEnv());
+
+      expect(html).toMatch(/<button[^>]*name="consent_action"[^>]*value="deny"[^>]*formnovalidate/);
     });
 
     it("rejects a wrong passphrase with 403 and never issues an authorization code", async () => {
@@ -3259,6 +3267,41 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const body = await lockedRes.json<any>();
       expect(body.error).toBe("access_denied");
       expect(body.error_description).toBe("Too many failed attempts. Try again later.");
+    });
+
+    it("atomically allows exactly 5 verifications and throttles the remaining parallel attempts", async () => {
+      const client = await registerClient("Passphrase Atomic Client");
+      const testEnv = passphraseEnv();
+      const url = await buildAuthUrl(client.client_id, "atomic-state");
+
+      const csrfTokens: string[] = [];
+      for (let i = 0; i < 8; i++) {
+        const { csrfToken } = await getCsrf(url, testEnv);
+        csrfTokens.push(csrfToken);
+      }
+
+      const responses = await Promise.all(
+        csrfTokens.map((csrfToken) =>
+          postConsent(url, testEnv, {
+            consent_action: "approve",
+            csrf_token: csrfToken,
+            owner_passphrase: "definitely-the-wrong-parallel-passphrase"
+          })
+        )
+      );
+
+      const statuses = responses.map((res) => res.status);
+      expect(statuses.filter((status) => status === 403).length).toBe(5);
+      expect(statuses.filter((status) => status === 429).length).toBe(3);
+    });
+
+    it("trims configured and submitted passphrase whitespace before comparison", async () => {
+      const client = await registerClient("Passphrase Whitespace Client");
+      const testEnv = passphraseEnv({ OWNER_PASSPHRASE: `${ownerPassphrase}   ` });
+      const res = await submitAttempt(client.client_id, testEnv, `  ${ownerPassphrase}\t`, "whitespace-state");
+
+      expect(res.status).toBe(302);
+      expect(res.headers.get("Location")).toBeTruthy();
     });
 
     it("resets the failure counter after a successful passphrase login", async () => {

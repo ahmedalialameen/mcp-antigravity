@@ -127,7 +127,7 @@ export function getOwnerPassphraseConfig(env: Env): OwnerPassphraseConfig | null
     return null;
   }
 
-  return { ownerId, passphrase };
+  return { ownerId, passphrase: passphrase.trim() };
 }
 
 /**
@@ -137,14 +137,20 @@ export async function verifyOwnerPassphrase(
   submitted: string | null | undefined,
   configured: string
 ): Promise<boolean> {
-  if (typeof submitted !== "string" || submitted.length === 0 || typeof configured !== "string") {
+  if (typeof submitted !== "string" || typeof configured !== "string") {
+    return false;
+  }
+
+  const normalizedSubmitted = submitted.trim();
+  const normalizedConfigured = configured.trim();
+  if (normalizedSubmitted.length === 0 || normalizedConfigured.length === 0) {
     return false;
   }
 
   const encoder = new TextEncoder();
   const [submittedDigest, configuredDigest] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(submitted)),
-    crypto.subtle.digest("SHA-256", encoder.encode(configured))
+    crypto.subtle.digest("SHA-256", encoder.encode(normalizedSubmitted)),
+    crypto.subtle.digest("SHA-256", encoder.encode(normalizedConfigured))
   ]);
 
   return crypto.subtle.timingSafeEqual(submittedDigest, configuredDigest);
@@ -1635,19 +1641,6 @@ export const oauth = new OAuthProvider({
             const csrfToken = (formData.get("csrf_token") as string) || "";
             const csrfSecret = env.CONSENT_CSRF_SECRET;
 
-            if (usePassphraseMode) {
-              const locked = await isPassphraseThrottleLocked(env);
-              if (locked) {
-                return new Response(
-                  JSON.stringify({
-                    error: "access_denied",
-                    error_description: "Too many failed attempts. Try again later."
-                  }),
-                  { status: 429, headers: { "Content-Type": "application/json" } }
-                );
-              }
-            }
-
             if (!csrfSecret) {
               return new Response(
                 JSON.stringify({
@@ -1688,6 +1681,17 @@ export const oauth = new OAuthProvider({
 
             if (action === "approve") {
               if (usePassphraseMode && passphraseConfig) {
+                const attempt = await recordPassphraseFailure(env);
+                if (attempt.failures > PASSPHRASE_MAX_FAILURES) {
+                  return new Response(
+                    JSON.stringify({
+                      error: "access_denied",
+                      error_description: "Too many failed attempts. Try again later."
+                    }),
+                    { status: 429, headers: { "Content-Type": "application/json" } }
+                  );
+                }
+
                 const submittedPassphrase = formData.get("owner_passphrase");
                 const passphraseValid = await verifyOwnerPassphrase(
                   typeof submittedPassphrase === "string" ? submittedPassphrase : null,
@@ -1695,7 +1699,6 @@ export const oauth = new OAuthProvider({
                 );
 
                 if (!passphraseValid) {
-                  await recordPassphraseFailure(env);
                   return new Response(
                     JSON.stringify({
                       error: "access_denied",
@@ -1777,7 +1780,7 @@ export const oauth = new OAuthProvider({
 <body>
   <div class="card">
     <h2>Authorize Application</h2>
-    <p><strong>${safeUserId}</strong>, do you authorize <strong>${safeClientName}</strong> to access the Antigravity MCP Server?</p>
+    <p>${usePassphraseMode ? "" : `<strong>${safeUserId}</strong>, `}do you authorize <strong>${safeClientName}</strong> to access the Antigravity MCP Server?</p>
     <p>Requested Scopes:</p>
     <div class="scopes">${safeScopes}</div>
     <p><small>Resource: ${safeResource}</small></p>
@@ -1789,7 +1792,7 @@ export const oauth = new OAuthProvider({
       </p>` : ""}
       <div class="buttons">
         <button type="submit" name="consent_action" value="approve" class="btn approve">Approve</button>
-        <button type="submit" name="consent_action" value="deny" class="btn deny">Deny</button>
+        <button type="submit" name="consent_action" value="deny" formnovalidate class="btn deny">Deny</button>
       </div>
     </form>
   </div>
