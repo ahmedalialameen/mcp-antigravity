@@ -78,6 +78,67 @@ async function signTestJwt(
   return `${hB64}.${pB64}.${sB64}`;
 }
 
+async function fetchConsentPageForRedirect(redirectUri: string): Promise<Response> {
+  const authSecret = "test-auth-secret";
+  const testEnv = {
+    ...env,
+    ALLOWED_USERS: "user@example.com",
+    AUTH_SECRET: authSecret,
+    CONSENT_CSRF_SECRET: "test-consent-csrf-secret",
+    MCP_RESOURCE: "http://example.com/mcp"
+  };
+
+  const ctx1 = createExecutionContext();
+  const regRes = await worker.fetch(
+    new Request("http://example.com/oauth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "CSP Test Client",
+        redirect_uris: [redirectUri],
+        token_endpoint_auth_method: "client_secret_basic"
+      })
+    }),
+    testEnv as any,
+    ctx1
+  );
+  await waitOnExecutionContext(ctx1);
+  const regData = await regRes.json<any>();
+
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(authSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode("user@example.com"));
+  const sigHex = Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  const authUrl =
+    `http://example.com/oauth/authorize?response_type=code` +
+    `&client_id=${encodeURIComponent(regData.client_id)}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&code_challenge=xyz&code_challenge_method=S256&scope=mcp&state=mystate`;
+
+  const ctx2 = createExecutionContext();
+  const authRes = await worker.fetch(
+    new Request(authUrl, {
+      headers: {
+        "X-Auth-User": "user@example.com",
+        "X-Auth-Signature": sigHex
+      }
+    }),
+    testEnv as any,
+    ctx2
+  );
+  await waitOnExecutionContext(ctx2);
+  return authRes;
+}
+
 describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
   beforeEach(async () => {
     vi.restoreAllMocks();
@@ -796,6 +857,44 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(html).not.toContain("<script>alert(1)</script>");
       expect(html).not.toContain("<img src=x onerror=alert(2)>");
       expect(html).toContain("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;");
+    });
+
+    it("adds the validated redirect URI origin to the form-action CSP", async () => {
+      const authRes = await fetchConsentPageForRedirect("https://claude.ai/api/mcp/auth_callback");
+
+      expect(authRes.status).toBe(200);
+      const csp = authRes.headers.get("Content-Security-Policy");
+      expect(csp).toContain("form-action 'self' https://claude.ai;");
+      expect(csp).toContain("default-src 'none'");
+      expect(csp).toContain("style-src 'unsafe-inline'");
+      expect(csp).toContain("frame-ancestors 'none'");
+      expect(csp).toContain("base-uri 'none'");
+    });
+
+    it("adds a custom-scheme redirect to the form-action CSP using its scheme", async () => {
+      const authRes = await fetchConsentPageForRedirect("com.example.app:/oauth/callback");
+
+      expect(authRes.status).toBe(200);
+      const csp = authRes.headers.get("Content-Security-Policy");
+      expect(csp).toContain("form-action 'self' com.example.app:;");
+      expect(csp).toContain("default-src 'none'");
+      expect(csp).toContain("frame-ancestors 'none'");
+    });
+
+    it("does not let semicolons or spaces in the redirect URI alter other CSP directives", async () => {
+      for (const redirectUri of [
+        "https://example.com/cb;script-src 'unsafe-inline'",
+        "https://example.com/cb with space"
+      ]) {
+        const authRes = await fetchConsentPageForRedirect(redirectUri);
+
+        expect(authRes.status).toBe(200);
+        const csp = authRes.headers.get("Content-Security-Policy");
+        expect(csp).toBe(
+          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none';"
+        );
+        expect(csp).not.toContain("script-src");
+      }
     });
 
     it("rejects unsafe URL schemes during registration (e.g. javascript:, data:)", async () => {
