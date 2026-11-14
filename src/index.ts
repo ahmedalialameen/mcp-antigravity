@@ -168,6 +168,66 @@ export function isSafeUrl(urlStr: string): boolean {
   }
 }
 
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  if (LOOPBACK_HOSTNAMES.has(normalized) || normalized.endsWith(".localhost")) {
+    return true;
+  }
+  return /^127(?:\.\d{1,3}){3}$/.test(normalized);
+}
+
+export function getConsentFormActionSource(redirectUri: string): string | null {
+  if (typeof redirectUri !== "string" || !redirectUri) {
+    return null;
+  }
+
+  if (/[\s;,'"]/.test(redirectUri)) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(redirectUri);
+    let source: string;
+
+    if (parsed.protocol === "https:") {
+      source = parsed.origin;
+    } else if (parsed.protocol === "http:") {
+      if (!isLoopbackHostname(parsed.hostname)) {
+        return null;
+      }
+      source = parsed.origin;
+    } else {
+      const unsafeSchemes = new Set([
+        "javascript:",
+        "data:",
+        "blob:",
+        "file:",
+        "vbscript:",
+        "about:",
+        "ws:",
+        "wss:",
+        "ftp:",
+        "http:",
+        "https:"
+      ]);
+      if (unsafeSchemes.has(parsed.protocol)) {
+        return null;
+      }
+      source = parsed.protocol;
+    }
+
+    if (!source || /[\s;,'"]/.test(source)) {
+      return null;
+    }
+
+    return source;
+  } catch {
+    return null;
+  }
+}
+
 export interface AntigravityOptions {
   timeoutMs?: number;
   maxPollIntervalMs?: number;
@@ -1761,6 +1821,9 @@ export const oauth = new OAuthProvider({
           // Fixed trusted form action path to prevent reflected script/parameter injection
           const safeAction = "/oauth/authorize" + escapeHtml(url.search);
 
+          const formActionSource = getConsentFormActionSource(authRequest.redirectUri);
+          const formAction = formActionSource ? `'self' ${formActionSource}` : "'self'";
+
           const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -1802,7 +1865,7 @@ export const oauth = new OAuthProvider({
             status: 200,
             headers: {
               "Content-Type": "text/html; charset=utf-8",
-              "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none';",
+              "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none';`,
               "X-Frame-Options": "DENY",
               "X-Content-Type-Options": "nosniff"
             }
