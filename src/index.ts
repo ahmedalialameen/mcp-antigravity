@@ -191,9 +191,30 @@ export function getConsentFormActionSource(redirectUri: string): string | null {
     const parsed = new URL(redirectUri);
     let source: string;
 
-    if (parsed.protocol === "https:" || (parsed.protocol === "http:" && isLoopbackHostname(parsed.hostname))) {
+    if (parsed.protocol === "https:") {
+      source = parsed.origin;
+    } else if (parsed.protocol === "http:") {
+      if (!isLoopbackHostname(parsed.hostname)) {
+        return null;
+      }
       source = parsed.origin;
     } else {
+      const unsafeSchemes = new Set([
+        "javascript:",
+        "data:",
+        "blob:",
+        "file:",
+        "vbscript:",
+        "about:",
+        "ws:",
+        "wss:",
+        "ftp:",
+        "http:",
+        "https:"
+      ]);
+      if (unsafeSchemes.has(parsed.protocol)) {
+        return null;
+      }
       source = parsed.protocol;
     }
 

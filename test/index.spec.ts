@@ -5,6 +5,7 @@ import worker, {
   authenticateAndAuthorizeUser,
   verifyCloudflareAccessJwt,
   validateBearerToken,
+  getConsentFormActionSource,
   getCanonicalResourceUri,
   validateWorkspaceFiles,
   createConsentCsrfToken,
@@ -703,6 +704,25 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
   });
 
   describe("3. OAuth 2.1 Consent, PKCE & Authorization", () => {
+    describe("getConsentFormActionSource", () => {
+      it("returns null for non-loopback http redirect URIs", () => {
+        expect(getConsentFormActionSource("http://example.com/cb")).toBeNull();
+      });
+
+      it("returns null for unsafe schemes such as javascript: and data:", () => {
+        expect(getConsentFormActionSource("javascript:alert(1)")).toBeNull();
+        expect(getConsentFormActionSource("data:text/html,x")).toBeNull();
+      });
+
+      it("returns the origin for loopback http redirect URIs", () => {
+        expect(getConsentFormActionSource("http://localhost:8080/cb")).toBe("http://localhost:8080");
+      });
+
+      it("returns the origin for https redirect URIs", () => {
+        expect(getConsentFormActionSource("https://claude.ai/api/mcp/auth_callback")).toBe("https://claude.ai");
+      });
+    });
+
     it("handles dynamic client registration via /oauth/register", async () => {
       const clientPayload = {
         client_name: "Claude Code Client",
