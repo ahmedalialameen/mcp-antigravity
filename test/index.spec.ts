@@ -28,7 +28,17 @@ import worker, {
   GITHUB_MCP_IMPLEMENT_TOOLS,
   resetPassphraseThrottle,
   recordPassphraseFailure,
-  PASSPHRASE_MAX_FAILURES
+  PASSPHRASE_MAX_FAILURES,
+  createInteraction,
+  getInteraction,
+  cancelInteraction,
+  waitForInteraction,
+  formatTaskResult,
+  isValidTaskId,
+  validateTaskId,
+  taskIndexKey,
+  TASK_INDEX_PREFIX,
+  MAX_OUTPUT_CHARS
 } from "../src/index";
 import {
   env,
@@ -308,7 +318,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
     });
 
-    it("rejects empty response {} or missing/malformed status strictly (Greptile P2)", async () => {
+    it("rejects empty or missing status but returns unknown and non-terminal statuses", async () => {
       // 1. Initial response {}
       vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
         return Response.json({}, { status: 200 });
@@ -325,13 +335,14 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         "Missing or invalid 'status' in initial response"
       );
 
-      // 3. Unknown status value
+      // 3. Unknown status value is returned as-is, not thrown
       vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
         return Response.json({ id: "int-unknown", status: "some_weird_status" }, { status: 200 });
       });
-      await expect(callAntigravityAgent("fake_key", "prompt")).rejects.toThrow(
-        "Unknown interaction status 'some_weird_status' in initial response"
-      );
+      const unknownResult = await callAntigravityAgent("fake_key", "prompt", undefined, {
+        maxPollTimeMs: 0
+      });
+      expect(unknownResult.status).toBe("some_weird_status");
 
       // 4. Polling response missing status
       let pollCall = 0;
@@ -346,7 +357,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         callAntigravityAgent("fake_key", "prompt", undefined, { maxPollIntervalMs: 5, maxPollTimeMs: 500 })
       ).rejects.toThrow("Missing or invalid 'status' in polling response");
 
-      // 5. Polling response with malformed/unknown status
+      // 5. Polling response with an unknown status is returned as-is (non-terminal)
       pollCall = 0;
       vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
         pollCall++;
@@ -355,19 +366,22 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         }
         return Response.json({ id: "int-poll-bad2", status: "bogus_status" }, { status: 200 });
       });
-      await expect(
-        callAntigravityAgent("fake_key", "prompt", undefined, { maxPollIntervalMs: 5, maxPollTimeMs: 500 })
-      ).rejects.toThrow("Unknown interaction status 'bogus_status' in polling response");
+      const unknownPollResult = await callAntigravityAgent("fake_key", "prompt", undefined, {
+        maxPollIntervalMs: 5,
+        maxPollTimeMs: 20
+      });
+      expect(unknownPollResult.status).toBe("bogus_status");
 
-      // 6. requires_action is rejected as unsupported
+      // 6. requires_action is returned as-is, not thrown as unsupported
       vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
         return Response.json({ id: "int-action", status: "requires_action" }, { status: 200 });
       });
-      await expect(callAntigravityAgent("fake_key", "prompt")).rejects.toThrow(
-        "Continuation flows are currently unsupported"
-      );
+      const actionResult = await callAntigravityAgent("fake_key", "prompt", undefined, {
+        maxPollTimeMs: 0
+      });
+      expect(actionResult.status).toBe("requires_action");
 
-      // 7. cancelled status is rejected
+      // 7. cancelled status still rejects in the legacy high-level helper
       vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
         return Response.json({ id: "int-cancelled", status: "cancelled" }, { status: 200 });
       });
@@ -417,6 +431,556 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       await expect(callAntigravityAgent(secretKey, "prompt")).rejects.toThrow(
         /Google Antigravity request failed: The operation was aborted for key \[REDACTED_API_KEY\]/
       );
+    });
+  });
+
+  describe("1b. Antigravity async task lifecycle", () => {
+    const taskEnv = {
+      ...env,
+      GEMINI_API_KEY: "task-test-api-key-123",
+      GITHUB_MCP_READ_CREDENTIAL_ID: "cred-read",
+      GITHUB_MCP_WRITE_CREDENTIAL_ID: "cred-write"
+    };
+
+    async function makeHandler(testEnv: any = taskEnv) {
+      const { createMcpHandler } = await import("@modelcontextprotocol/server");
+      return createMcpHandler(() => createAntigravityMcpServer(testEnv));
+    }
+
+    async function clearTaskIndex() {
+      let cursor: string | undefined;
+      do {
+        const page = await env.OAUTH_KV.list({ prefix: TASK_INDEX_PREFIX, cursor });
+        for (const key of page.keys) {
+          await env.OAUTH_KV.delete(key.name);
+        }
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
+    }
+
+    async function callTool(handler: any, name: string, args: any) {
+      const req = new Request("http://example.com/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream"
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name, arguments: args }
+        })
+      });
+      const res = await handler.fetch(req);
+      const body = await res.text();
+      let rpc: any;
+      try {
+        rpc = JSON.parse(body);
+      } catch {
+        const dataLines = body
+          .split(/\r?\n/)
+          .filter((line: string) => line.startsWith("data: "));
+        rpc = JSON.parse(dataLines[dataLines.length - 1].slice(6));
+      }
+      const result = rpc.result || rpc;
+      const text = result?.content?.[0]?.text || "";
+      let data: any;
+      try {
+        data = JSON.parse(text);
+      } catch {}
+      return { text, data, isError: result?.isError === true, body };
+    }
+
+    beforeEach(async () => {
+      await clearTaskIndex();
+    });
+
+    it("createInteraction sends background and store, and returns the id without polling", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json({ id: "int-create-1", status: "in_progress" }, { status: 200 });
+      });
+
+      const interaction = await createInteraction("test-key", { prompt: "Long task" }, taskEnv as any);
+
+      expect(interaction.id).toBe("int-create-1");
+      expect(interaction.status).toBe("in_progress");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/interactions");
+      expect(init?.method).toBe("POST");
+      const payload = JSON.parse(init?.body as string);
+      expect(payload.background).toBe(true);
+      expect(payload.store).toBe(true);
+      expect(new Headers(init?.headers).get("x-goog-api-key")).toBe("test-key");
+    });
+
+    it("run_antigravity_agent returns completed text and a non-error in-progress task", async () => {
+      const completedHandler = await makeHandler();
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json(
+          { id: "int-run-done", status: "completed", output_text: "Run completed text" },
+          { status: 200 }
+        );
+      });
+
+      const completed = await callTool(completedHandler, "run_antigravity_agent", {
+        task: "Finish quickly",
+        waitSeconds: 0
+      });
+      expect(completed.isError).toBe(false);
+      expect(completed.data.status).toBe("completed");
+      expect(completed.data.done).toBe(true);
+      expect(completed.data.taskId).toBe("int-run-done");
+      expect(completed.text).toContain("Run completed text");
+
+      const runningHandler = await makeHandler();
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json({ id: "int-run-live", status: "in_progress" }, { status: 200 });
+      });
+
+      const running = await callTool(runningHandler, "run_antigravity_agent", {
+        task: "Keep running",
+        waitSeconds: 0
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(running.isError).toBe(false);
+      expect(running.data.status).toBe("in_progress");
+      expect(running.data.taskId).toBe("int-run-live");
+      expect(running.text).toContain("get_antigravity_task");
+    });
+
+    it("run_antigravity_agent returns isError for failed and cancelled tasks", async () => {
+      const handler = await makeHandler();
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json(
+          { id: "int-run-fail", status: "failed", error: { message: "Agent crashed" } },
+          { status: 200 }
+        );
+      });
+      const failed = await callTool(handler, "run_antigravity_agent", {
+        task: "Fail",
+        waitSeconds: 0
+      });
+      expect(failed.isError).toBe(true);
+      expect(failed.data.taskId).toBe("int-run-fail");
+      expect(failed.text).toContain("Agent crashed");
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json({ id: "int-run-cancel", status: "cancelled" }, { status: 200 });
+      });
+      const cancelled = await callTool(handler, "run_antigravity_agent", {
+        task: "Cancel",
+        waitSeconds: 0
+      });
+      expect(cancelled.isError).toBe(true);
+      expect(cancelled.data.taskId).toBe("int-run-cancel");
+      expect(cancelled.text).toContain("cancelled");
+    });
+
+    it("get_antigravity_task polls in_progress to completed", async () => {
+      const handler = await makeHandler();
+      let call = 0;
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        call++;
+        if (call === 1) {
+          return Response.json({ id: "int-get-poll", status: "in_progress" }, { status: 200 });
+        }
+        return Response.json(
+          { id: "int-get-poll", status: "completed", output_text: "Polled to completion" },
+          { status: 200 }
+        );
+      });
+
+      const result = await callTool(handler, "get_antigravity_task", {
+        taskId: "int-get-poll",
+        waitSeconds: 1
+      });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBe(false);
+      expect(result.data.status).toBe("completed");
+      expect(result.data.done).toBe(true);
+      expect(result.text).toContain("Polled to completion");
+    });
+
+    it("get_antigravity_task returns unknown and requires_action statuses instead of throwing", async () => {
+      const handler = await makeHandler();
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json({ id: "int-get-unknown", status: "mystery_state" }, { status: 200 });
+      });
+      const unknown = await callTool(handler, "get_antigravity_task", {
+        taskId: "int-get-unknown",
+        waitSeconds: 0
+      });
+      expect(unknown.isError).toBe(false);
+      expect(unknown.data.status).toBe("mystery_state");
+      expect(unknown.data.done).toBe(false);
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json({ id: "int-get-action", status: "requires_action" }, { status: 200 });
+      });
+      const action = await callTool(handler, "get_antigravity_task", {
+        taskId: "int-get-action",
+        waitSeconds: 0
+      });
+      expect(action.isError).toBe(false);
+      expect(action.data.status).toBe("requires_action");
+      expect(action.data.done).toBe(false);
+    });
+
+    it("cancel_antigravity_task posts to /cancel and does not fail for finished tasks", async () => {
+      const handler = await makeHandler();
+      let cancelMethod = "";
+      let cancelUrl = "";
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+        const urlStr = String(url);
+        if (urlStr.includes("int-cancel-running/cancel")) {
+          cancelUrl = urlStr;
+          cancelMethod = String(init?.method);
+          return Response.json({ id: "int-cancel-running", status: "cancelled" }, { status: 200 });
+        }
+        if (urlStr.includes("int-cancel-finished/cancel")) {
+          return Response.json({ id: "int-cancel-finished", status: "completed" }, { status: 200 });
+        }
+        return new Response("Not found", { status: 404 });
+      });
+
+      const running = await callTool(handler, "cancel_antigravity_task", {
+        taskId: "int-cancel-running"
+      });
+      expect(cancelUrl).toBe(
+        "https://generativelanguage.googleapis.com/v1beta/interactions/int-cancel-running/cancel"
+      );
+      expect(cancelMethod).toBe("POST");
+      expect(running.isError).toBe(false);
+      expect(running.data.status).toBe("cancelled");
+
+      const finished = await callTool(handler, "cancel_antigravity_task", {
+        taskId: "int-cancel-finished"
+      });
+      expect(finished.isError).toBe(false);
+      expect(finished.data.status).toBe("completed");
+    });
+
+    it("indexes tasks and refreshes the KV record and metadata when status changes", async () => {
+      const handler = await makeHandler();
+      let call = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        call++;
+        if (call === 1) {
+          return Response.json({ id: "int-index-record", status: "in_progress" }, { status: 200 });
+        }
+        return Response.json(
+          { id: "int-index-record", status: "completed", output_text: "Indexed done" },
+          { status: 200 }
+        );
+      });
+
+      const started = await callTool(handler, "start_antigravity_task", {
+        task: "A".repeat(300)
+      });
+      expect(started.isError).toBe(false);
+      expect(started.data.taskId).toBe("int-index-record");
+      expect(started.data.status).toBe("in_progress");
+
+      const initial = await env.OAUTH_KV.getWithMetadata(taskIndexKey("int-index-record"), {
+        type: "json"
+      });
+      const initialValue = initial.value as any;
+      const initialMetadata = initial.metadata as any;
+      expect(initialValue.taskId).toBe("int-index-record");
+      expect(initialValue.mode).toBe("plain");
+      expect(initialValue.taskPreview.length).toBe(200);
+      expect(initialMetadata.status).toBe("in_progress");
+      expect(initialMetadata.createdAt).toBe(initialValue.createdAt);
+
+      const fetched = await callTool(handler, "get_antigravity_task", {
+        taskId: "int-index-record",
+        waitSeconds: 0
+      });
+      expect(fetched.isError).toBe(false);
+      expect(fetched.data.status).toBe("completed");
+
+      const refreshed = await env.OAUTH_KV.getWithMetadata(taskIndexKey("int-index-record"), {
+        type: "json"
+      });
+      const refreshedValue = refreshed.value as any;
+      const refreshedMetadata = refreshed.metadata as any;
+      expect(refreshedValue.status).toBe("completed");
+      expect(refreshedValue.createdAt).toBe(initialValue.createdAt);
+      expect(refreshedMetadata.status).toBe("completed");
+    });
+
+    it("list_antigravity_tasks sorts newest first, filters, limits, and follows KV cursors", async () => {
+      const listMock = vi.fn();
+      listMock.mockResolvedValueOnce({
+        keys: [
+          {
+            name: `${TASK_INDEX_PREFIX}old-task`,
+            metadata: {
+              createdAt: "2026-01-01T00:00:00.000Z",
+              status: "completed",
+              mode: "plain",
+              taskPreview: "old"
+            }
+          },
+          {
+            name: `${TASK_INDEX_PREFIX}mid-task`,
+            metadata: {
+              createdAt: "2026-02-01T00:00:00.000Z",
+              status: "in_progress",
+              mode: "inspect",
+              taskPreview: "mid"
+            }
+          }
+        ],
+        cursor: "cursor-1"
+      });
+      listMock.mockResolvedValueOnce({
+        keys: [
+          {
+            name: `${TASK_INDEX_PREFIX}new-task`,
+            metadata: {
+              createdAt: "2026-03-01T00:00:00.000Z",
+              status: "completed",
+              mode: "review",
+              taskPreview: "new"
+            }
+          }
+        ]
+      });
+      const handler = await makeHandler({
+        ...taskEnv,
+        OAUTH_KV: { list: listMock, get: vi.fn(), put: vi.fn(), delete: vi.fn() }
+      });
+
+      const limited = await callTool(handler, "list_antigravity_tasks", { limit: 2 });
+      expect(limited.isError).toBe(false);
+      expect(listMock).toHaveBeenCalledTimes(2);
+      expect(limited.data.tasks.map((t: any) => t.taskId)).toEqual(["new-task", "mid-task"]);
+      expect(limited.data.tasks[0]).toEqual({
+        taskId: "new-task",
+        status: "completed",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        mode: "review",
+        taskPreview: "new"
+      });
+
+      listMock.mockResolvedValue({
+        keys: [
+          {
+            name: `${TASK_INDEX_PREFIX}old-task`,
+            metadata: {
+              createdAt: "2026-01-01T00:00:00.000Z",
+              status: "completed",
+              mode: "plain",
+              taskPreview: "old"
+            }
+          },
+          {
+            name: `${TASK_INDEX_PREFIX}mid-task`,
+            metadata: {
+              createdAt: "2026-02-01T00:00:00.000Z",
+              status: "in_progress",
+              mode: "inspect",
+              taskPreview: "mid"
+            }
+          }
+        ]
+      });
+      const filtered = await callTool(handler, "list_antigravity_tasks", {
+        limit: 50,
+        status: "completed"
+      });
+      expect(filtered.data.tasks.map((t: any) => t.taskId)).toEqual(["old-task"]);
+    });
+
+    it("KV get, put, and list failures never fail start, run, get, or list", async () => {
+      const failingKv = {
+        get: vi.fn().mockRejectedValue(new Error("kv get down")),
+        put: vi.fn().mockRejectedValue(new Error("kv put down")),
+        list: vi.fn().mockRejectedValue(new Error("kv list down")),
+        delete: vi.fn()
+      };
+      const handler = await makeHandler({ ...taskEnv, OAUTH_KV: failingKv });
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json(
+          { id: "int-kv-fail", status: "completed", output_text: "KV failure survived" },
+          { status: 200 }
+        );
+      });
+
+      const started = await callTool(handler, "start_antigravity_task", { task: "Start despite KV" });
+      expect(started.isError).toBe(false);
+      expect(started.data.taskId).toBe("int-kv-fail");
+
+      const ran = await callTool(handler, "run_antigravity_agent", {
+        task: "Run despite KV",
+        waitSeconds: 0
+      });
+      expect(ran.isError).toBe(false);
+      expect(ran.text).toContain("KV failure survived");
+
+      const fetched = await callTool(handler, "get_antigravity_task", {
+        taskId: "int-kv-fail",
+        waitSeconds: 0
+      });
+      expect(fetched.isError).toBe(false);
+      expect(fetched.data.status).toBe("completed");
+
+      const listed = await callTool(handler, "list_antigravity_tasks", { limit: 5 });
+      expect(listed.isError).toBe(false);
+      expect(listed.data.tasks).toEqual([]);
+    });
+
+    it("rejects invalid taskIds before any fetch or KV call", async () => {
+      const kv = {
+        get: vi.fn(),
+        put: vi.fn(),
+        list: vi.fn(),
+        delete: vi.fn()
+      };
+      const handler = await makeHandler({ ...taskEnv, OAUTH_KV: kv });
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      for (const taskId of ["../escape", "", "x".repeat(201)]) {
+        const got = await callTool(handler, "get_antigravity_task", { taskId, waitSeconds: 0 });
+        expect(got.isError).toBe(true);
+        expect(got.text).toContain("Invalid taskId");
+
+        const cancelled = await callTool(handler, "cancel_antigravity_task", { taskId });
+        expect(cancelled.isError).toBe(true);
+        expect(cancelled.text).toContain("Invalid taskId");
+      }
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(kv.get).not.toHaveBeenCalled();
+      expect(kv.put).not.toHaveBeenCalled();
+      expect(kv.list).not.toHaveBeenCalled();
+      expect(isValidTaskId("../escape")).toBe(false);
+      expect(() => validateTaskId("")).toThrow("Invalid taskId");
+    });
+
+    it("pages output text and provides a sanitized raw fallback", () => {
+      const longText = "z".repeat(MAX_OUTPUT_CHARS + 25);
+      const first = JSON.parse(
+        formatTaskResult(
+          { id: "int-page", status: "completed", output_text: longText },
+          { offset: 0, apiKey: "page-key" }
+        )
+      );
+      expect(first.outputText.length).toBe(MAX_OUTPUT_CHARS);
+      expect(first.totalChars).toBe(longText.length);
+      expect(first.truncated).toBe(true);
+      expect(first.nextOffset).toBe(MAX_OUTPUT_CHARS);
+
+      const last = JSON.parse(
+        formatTaskResult(
+          { id: "int-page", status: "completed", output_text: longText },
+          { offset: MAX_OUTPUT_CHARS, apiKey: "page-key" }
+        )
+      );
+      expect(last.outputText.length).toBe(25);
+      expect(last.truncated).toBe(false);
+      expect(last.nextOffset).toBeUndefined();
+
+      const fallback = JSON.parse(
+        formatTaskResult(
+          { id: "int-raw-fallback", status: "completed", some_field: "raw value" },
+          { apiKey: "page-key" }
+        )
+      );
+      expect(fallback.outputText).toBeUndefined();
+      expect(fallback.rawFallback).toContain("some_field");
+      expect(fallback.totalChars).toBeGreaterThan(0);
+
+      const withRaw = JSON.parse(
+        formatTaskResult(
+          {
+            id: "int-raw",
+            status: "completed",
+            output_text: "short",
+            usage: { input_tokens: 3 }
+          },
+          { includeRaw: true, apiKey: "page-key" }
+        )
+      );
+      expect(withRaw.raw).toContain("int-raw");
+      expect(withRaw.usage).toEqual({ input_tokens: 3 });
+    });
+
+    it("never returns the API key in results, errors, or console warnings", async () => {
+      const secret = "DISTINCTIVE_TASK_API_KEY_9f8e7d6c";
+      const failingKv = {
+        get: vi.fn().mockRejectedValue(new Error("kv get down")),
+        put: vi.fn().mockRejectedValue(new Error("kv put down")),
+        list: vi.fn().mockRejectedValue(new Error("kv list down")),
+        delete: vi.fn()
+      };
+      const handler = await makeHandler({
+        ...taskEnv,
+        GEMINI_API_KEY: secret,
+        OAUTH_KV: failingKv
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json(
+          {
+            id: "int-secret-out",
+            status: "failed",
+            error: { message: `Boom ${secret}` },
+            output_text: `Leaked ${secret}`
+          },
+          { status: 200 }
+        );
+      });
+      const failed = await callTool(handler, "run_antigravity_agent", {
+        task: "Secret path",
+        waitSeconds: 0
+      });
+      expect(failed.isError).toBe(true);
+      expect(failed.text).toContain("[REDACTED_API_KEY]");
+      expect(failed.text).not.toContain(secret);
+      expect(warnSpy.mock.calls.flat().join(" ")).not.toContain(secret);
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json(
+          { id: "int-secret-http", status: "completed" },
+          { status: 500 }
+        );
+      });
+      const httpError = await callTool(handler, "start_antigravity_task", { task: "HTTP error" });
+      expect(httpError.isError).toBe(true);
+      expect(httpError.text).not.toContain(secret);
+    });
+
+    it("repo modes still fail closed without credentials, including implement", async () => {
+      const handler = await makeHandler({
+        ...taskEnv,
+        GITHUB_MCP_READ_CREDENTIAL_ID: undefined,
+        GITHUB_MCP_WRITE_CREDENTIAL_ID: undefined
+      });
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      const inspect = await callTool(handler, "start_antigravity_task", {
+        task: "Inspect",
+        repository: "owner/repo",
+        mode: "inspect"
+      });
+      expect(inspect.isError).toBe(true);
+      expect(inspect.text).toContain("GITHUB_MCP_READ_CREDENTIAL_ID is not configured");
+
+      const implement = await callTool(handler, "start_antigravity_task", {
+        task: "Implement",
+        repository: "owner/repo",
+        mode: "implement"
+      });
+      expect(implement.isError).toBe(true);
+      expect(implement.text).toContain("GITHUB_MCP_WRITE_CREDENTIAL_ID is not configured");
+      expect(fetchSpy).not.toHaveBeenCalled();
     });
   });
 

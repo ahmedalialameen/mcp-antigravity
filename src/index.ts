@@ -247,17 +247,24 @@ const VALID_INTERACTION_STATUSES = [
 
 type InteractionStatus = (typeof VALID_INTERACTION_STATUSES)[number];
 
-function validateInteractionData(data: any, phase: "initial" | "polling"): asserts data is { status: InteractionStatus; [key: string]: any } {
+const TERMINAL_INTERACTION_STATUSES = new Set<string>([
+  "completed",
+  "failed",
+  "cancelled",
+  "incomplete"
+]);
+
+export function isTerminalInteractionStatus(status: string | undefined): boolean {
+  return typeof status === "string" && TERMINAL_INTERACTION_STATUSES.has(status);
+}
+
+function validateInteractionData(data: any, phase: "initial" | "polling"): asserts data is { status: string; [key: string]: any } {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw new Error(`Google Antigravity API error: Invalid ${phase} response format.`);
   }
 
   if (!("status" in data) || typeof data.status !== "string") {
     throw new Error(`Google Antigravity API error: Missing or invalid 'status' in ${phase} response.`);
-  }
-
-  if (!VALID_INTERACTION_STATUSES.includes(data.status as InteractionStatus)) {
-    throw new Error(`Google Antigravity API error: Unknown interaction status '${data.status}' in ${phase} response.`);
   }
 }
 
@@ -318,35 +325,69 @@ export function sanitizeSecret(text: string, secret?: string): string {
   return text.split(secret).join("[REDACTED_API_KEY]");
 }
 
-/**
- * Dispatches autonomous tasks to Google's Antigravity Agent endpoint.
- * Uses Google's official Interactions API request structure:
- * - agent: "antigravity-preview-09-2026"
- * - input: prompt (string)
- * - environment: "remote" | { type: "remote", sources: [...] }
- * - AbortSignal.timeout()
- * - Inspects interaction status and handles polling if in_progress.
- * - Never exposes Google API key in errors.
- */
-export async function callAntigravityAgent(
-  apiKey: string,
+export const INTERACTIONS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
+export const DEFAULT_INTERACTION_TIMEOUT_MS = 60000;
+export const TASK_INDEX_PREFIX = "antigravity:task:";
+export const TASK_INDEX_TTL_SECONDS = 30 * 24 * 60 * 60;
+export const MAX_OUTPUT_CHARS = 60000;
+export const MAX_TASK_PREVIEW_CHARS = 200;
+export const MAX_TASK_ERROR_CHARS = 500;
+export const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+
+export type AntigravityTaskIndexMode = AntigravityTaskMode | "plain";
+
+export interface AntigravityTaskIndexRecord {
+  taskId: string;
+  createdAt: string;
+  updatedAt: string;
+  status: string;
+  mode: AntigravityTaskIndexMode;
+  repository?: string;
+  ref?: string;
+  pullRequest?: number;
+  taskPreview: string;
+  lastError?: string;
+}
+
+export interface CreateInteractionInputs {
+  prompt: string;
+  workspaceFiles?: Record<string, string>;
+  repoContext?: AntigravityRepositoryContext;
+  timeoutMs?: number;
+}
+
+export interface InteractionRequestOptions {
+  timeoutMs?: number;
+}
+
+export interface FormatTaskResultOptions {
+  offset?: number;
+  includeRaw?: boolean;
+  apiKey?: string;
+}
+
+export function isValidTaskId(taskId: unknown): taskId is string {
+  return typeof taskId === "string" && TASK_ID_PATTERN.test(taskId);
+}
+
+export function validateTaskId(taskId: unknown): string {
+  if (!isValidTaskId(taskId)) {
+    throw new Error("Invalid taskId: expected 1-200 characters matching ^[A-Za-z0-9_-]{1,200}$.");
+  }
+  return taskId;
+}
+
+export function taskIndexKey(taskId: string): string {
+  return `${TASK_INDEX_PREFIX}${taskId}`;
+}
+
+function buildInteractionPayload(
   prompt: string,
   workspaceFiles?: Record<string, string>,
-  options?: AntigravityOptions,
   repoContext?: AntigravityRepositoryContext,
-  env?: Env
-) {
-  if (!apiKey || typeof apiKey !== "string") {
-    throw new Error("Missing or invalid Google Gemini API Key.");
-  }
-  if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
-    throw new Error("Prompt input cannot be empty.");
-  }
-
-  const timeoutMs = options?.timeoutMs ?? 60000;
-  const maxPollTimeMs = options?.maxPollTimeMs ?? 120000;
-  const pollIntervalMs = options?.maxPollIntervalMs ?? 1000;
-
+  env?: Env,
+  settings?: { background?: boolean; store?: boolean; storeOption?: boolean }
+): Record<string, any> {
   const sources = validateWorkspaceFiles(workspaceFiles);
 
   const payload: Record<string, any> = {
@@ -363,8 +404,16 @@ export async function callAntigravityAgent(
     payload.environment = "remote";
   }
 
-  if (options?.store !== undefined) {
-    payload.store = options.store;
+  if (settings?.background) {
+    payload.background = true;
+  }
+
+  if (settings?.store) {
+    payload.store = true;
+  }
+
+  if (settings?.storeOption !== undefined) {
+    payload.store = settings.storeOption;
   }
 
   if (repoContext) {
@@ -464,22 +513,32 @@ export async function callAntigravityAgent(
     payload.input = `[Repository Context]\n${contextLines.join("\n")}\n\n[Task]\n${prompt}`;
   }
 
-  const baseUrl = "https://generativelanguage.googleapis.com/v1beta/interactions";
+  return payload;
+}
 
+function extractErrorMessage(errorBody: string): string {
+  let parsedMessage = errorBody;
+  try {
+    const errJson = JSON.parse(errorBody);
+    if (errJson.error?.message) {
+      parsedMessage = errJson.error.message;
+    }
+  } catch {}
+  return parsedMessage;
+}
+
+async function performInteractionRequest(
+  url: string,
+  init: RequestInit,
+  apiKey: string,
+  labels: { network: string; http: string; malformed: string }
+): Promise<any> {
   let response: Response;
   try {
-    response = await fetch(baseUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(timeoutMs)
-    });
+    response = await fetch(url, init);
   } catch (err: any) {
     const safeMsg = sanitizeSecret(err?.message || "Network request failed", apiKey);
-    throw new Error(`Google Antigravity request failed: ${safeMsg}`);
+    throw new Error(`${labels.network}: ${safeMsg}`);
   }
 
   if (!response.ok) {
@@ -487,84 +546,218 @@ export async function callAntigravityAgent(
     try {
       errorBody = await response.text();
     } catch {}
-    let parsedMessage = errorBody;
-    try {
-      const errJson = JSON.parse(errorBody);
-      if (errJson.error?.message) {
-        parsedMessage = errJson.error.message;
-      }
-    } catch {}
-    const safeError = sanitizeSecret(parsedMessage, apiKey);
-    throw new Error(`Google Antigravity API error (${response.status}): ${safeError}`);
+    const safeError = sanitizeSecret(extractErrorMessage(errorBody), apiKey);
+    throw new Error(`${labels.http} (${response.status}): ${safeError}`);
   }
 
-  let data: any;
   try {
-    data = await response.json();
+    return await response.json();
   } catch {
-    throw new Error("Google Antigravity API error: Received malformed JSON response.");
+    throw new Error(labels.malformed);
   }
+}
+
+/**
+ * Creates a background interaction. The interaction id is returned immediately
+ * by Google when background execution is enabled; this function never polls.
+ */
+export async function createInteraction(
+  apiKey: string,
+  payloadInputs: CreateInteractionInputs,
+  env?: Env
+): Promise<any> {
+  if (!apiKey || typeof apiKey !== "string") {
+    throw new Error("Missing or invalid Google Gemini API Key.");
+  }
+  const prompt = payloadInputs?.prompt;
+  if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+    throw new Error("Prompt input cannot be empty.");
+  }
+
+  const timeoutMs = payloadInputs.timeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS;
+  const payload = buildInteractionPayload(
+    prompt,
+    payloadInputs.workspaceFiles,
+    payloadInputs.repoContext,
+    env,
+    { background: true, store: true }
+  );
+
+  const data = await performInteractionRequest(
+    INTERACTIONS_BASE_URL,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs)
+    },
+    apiKey,
+    {
+      network: "Google Antigravity request failed",
+      http: "Google Antigravity API error",
+      malformed: "Google Antigravity API error: Received malformed JSON response."
+    }
+  );
 
   validateInteractionData(data, "initial");
+  return data;
+}
 
-  // Handle polling if interaction is in_progress
-  const pollStartTime = Date.now();
-  const maxPolls = options?.maxPolls ?? 60;
-  let pollCount = 0;
-
-  while (data.status === "in_progress" && data.id) {
-    pollCount++;
-    if (pollCount > maxPolls) {
-      throw new Error(`Google Antigravity interaction exceeded maximum polling attempts (${maxPolls}).`);
+/**
+ * Fetches a single interaction by id.
+ */
+export async function getInteraction(
+  apiKey: string,
+  id: string,
+  options?: InteractionRequestOptions
+): Promise<any> {
+  if (!apiKey || typeof apiKey !== "string") {
+    throw new Error("Missing or invalid Google Gemini API Key.");
+  }
+  validateTaskId(id);
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS;
+  const data = await performInteractionRequest(
+    `${INTERACTIONS_BASE_URL}/${encodeURIComponent(id)}`,
+    {
+      method: "GET",
+      headers: {
+        "x-goog-api-key": apiKey
+      },
+      signal: AbortSignal.timeout(timeoutMs)
+    },
+    apiKey,
+    {
+      network: "Google Antigravity polling request failed",
+      http: "Google Antigravity polling error",
+      malformed: "Google Antigravity API polling error: Received malformed JSON response."
     }
-    if (Date.now() - pollStartTime > maxPollTimeMs) {
-      throw new Error(`Google Antigravity interaction timed out after ${maxPollTimeMs}ms while still in_progress.`);
+  );
+
+  validateInteractionData(data, "polling");
+  return data;
+}
+
+/**
+ * Cancels a background interaction. Cancelling an already-finished task is
+ * harmless: Google returns the interaction's current resource.
+ */
+export async function cancelInteraction(
+  apiKey: string,
+  id: string,
+  options?: InteractionRequestOptions
+): Promise<any> {
+  if (!apiKey || typeof apiKey !== "string") {
+    throw new Error("Missing or invalid Google Gemini API Key.");
+  }
+  validateTaskId(id);
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS;
+  const data = await performInteractionRequest(
+    `${INTERACTIONS_BASE_URL}/${encodeURIComponent(id)}/cancel`,
+    {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": apiKey
+      },
+      signal: AbortSignal.timeout(timeoutMs)
+    },
+    apiKey,
+    {
+      network: "Google Antigravity cancel request failed",
+      http: "Google Antigravity cancel error",
+      malformed: "Google Antigravity API cancel error: Received malformed JSON response."
     }
+  );
 
-    // Wait poll interval
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  validateInteractionData(data, "polling");
+  return data;
+}
 
-    const pollUrl = `${baseUrl}/${encodeURIComponent(data.id)}`;
-    let pollRes: Response;
-    try {
-      pollRes = await fetch(pollUrl, {
-        method: "GET",
-        headers: {
-          "x-goog-api-key": apiKey
-        },
-        signal: AbortSignal.timeout(timeoutMs)
-      });
-    } catch (err: any) {
-      const safeMsg = sanitizeSecret(err?.message || "Polling request failed", apiKey);
-      throw new Error(`Google Antigravity polling request failed: ${safeMsg}`);
-    }
-
-    if (!pollRes.ok) {
-      let pollErrBody = "";
-      try {
-        pollErrBody = await pollRes.text();
-      } catch {}
-      let parsedPollErr = pollErrBody;
-      try {
-        const errJson = JSON.parse(pollErrBody);
-        if (errJson.error?.message) {
-          parsedPollErr = errJson.error.message;
-        }
-      } catch {}
-      const safePollErr = sanitizeSecret(parsedPollErr, apiKey);
-      throw new Error(`Google Antigravity polling error (${pollRes.status}): ${safePollErr}`);
-    }
-
-    try {
-      data = await pollRes.json();
-    } catch {
-      throw new Error("Google Antigravity API polling error: Received malformed JSON response.");
-    }
-
-    validateInteractionData(data, "polling");
+/**
+ * Polls an interaction until it reaches a terminal status or the deadline
+ * passes. Returns the latest interaction either way and never throws merely
+ * because the deadline was reached.
+ */
+export async function waitForInteraction(
+  apiKey: string,
+  interaction: any,
+  waitMs = 0,
+  pollIntervalMs = 1000
+): Promise<any> {
+  let data = interaction;
+  if (!data || typeof data !== "object") {
+    return data;
   }
 
-  // Inspect final interaction status
+  const deadline = Date.now() + Math.max(0, waitMs);
+  const interval = Math.max(0, pollIntervalMs);
+
+  while (!isTerminalInteractionStatus(data.status) && Date.now() < deadline) {
+    if (!data.id) {
+      break;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(interval, remaining)));
+    data = await getInteraction(apiKey, String(data.id));
+  }
+
+  return data;
+}
+
+/**
+ * Backwards-compatible high-level helper. New code should use
+ * createInteraction/waitForInteraction so long tasks can outlive one request.
+ */
+export async function callAntigravityAgent(
+  apiKey: string,
+  prompt: string,
+  workspaceFiles?: Record<string, string>,
+  options?: AntigravityOptions,
+  repoContext?: AntigravityRepositoryContext,
+  env?: Env
+) {
+  if (!apiKey || typeof apiKey !== "string") {
+    throw new Error("Missing or invalid Google Gemini API Key.");
+  }
+  if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+    throw new Error("Prompt input cannot be empty.");
+  }
+
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS;
+  const maxPollTimeMs = options?.maxPollTimeMs ?? 120000;
+  const pollIntervalMs = options?.maxPollIntervalMs ?? 1000;
+
+  const payload = buildInteractionPayload(prompt, workspaceFiles, repoContext, env, {
+    storeOption: options?.store
+  });
+
+  let data = await performInteractionRequest(
+    INTERACTIONS_BASE_URL,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs)
+    },
+    apiKey,
+    {
+      network: "Google Antigravity request failed",
+      http: "Google Antigravity API error",
+      malformed: "Google Antigravity API error: Received malformed JSON response."
+    }
+  );
+
+  validateInteractionData(data, "initial");
+  data = await waitForInteraction(apiKey, data, maxPollTimeMs, pollIntervalMs);
+
   if (data.status === "failed") {
     const errorDetails = data.error?.message || data.output_text || JSON.stringify(data.error || "Interaction execution failed");
     throw new Error(`Google Antigravity interaction failed: ${sanitizeSecret(errorDetails, apiKey)}`);
@@ -578,17 +771,225 @@ export async function callAntigravityAgent(
     throw new Error("Google Antigravity interaction incomplete: Agent budget or token limit reached before task completion.");
   }
 
-  if (data.status === "requires_action") {
-    throw new Error("Google Antigravity interaction requires_action: Continuation flows are currently unsupported.");
-  }
-
-  if (data.status !== "completed") {
-    throw new Error(`Google Antigravity interaction finished with unexpected status: ${data.status}`);
-  }
-
   return data;
 }
 
+function sanitizeDeep(value: any, apiKey?: string): any {
+  if (!apiKey) return value;
+  if (typeof value === "string") {
+    return sanitizeSecret(value, apiKey);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeDeep(item, apiKey));
+  }
+  if (value && typeof value === "object") {
+    const result: Record<string, any> = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = sanitizeDeep(item, apiKey);
+    }
+    return result;
+  }
+  return value;
+}
+
+function pageText(
+  text: string,
+  offset: number
+): { text: string; truncated: boolean; totalChars: number; nextOffset?: number } {
+  const totalChars = text.length;
+  const safeOffset = Number.isInteger(offset) && offset >= 0 ? offset : 0;
+  const page = text.slice(safeOffset, safeOffset + MAX_OUTPUT_CHARS);
+  const truncated = safeOffset + page.length < totalChars;
+  return {
+    text: page,
+    truncated,
+    totalChars,
+    nextOffset: truncated ? safeOffset + page.length : undefined
+  };
+}
+
+/**
+ * Shapes a Google interaction into the stable JSON string returned by the
+ * task tools. All Google-provided text is sanitized before it is returned.
+ */
+export function formatTaskResult(
+  interaction: any,
+  options?: FormatTaskResultOptions
+): string {
+  const apiKey = options?.apiKey;
+  const offset = options?.offset ?? 0;
+  const includeRaw = options?.includeRaw === true;
+  const sanitizedInteraction = sanitizeDeep(interaction, apiKey);
+  const status = typeof sanitizedInteraction?.status === "string" ? sanitizedInteraction.status : "";
+  const taskId = typeof sanitizedInteraction?.id === "string" ? sanitizedInteraction.id : undefined;
+  const done = isTerminalInteractionStatus(status);
+
+  const outputTextValue =
+    typeof sanitizedInteraction?.output_text === "string" ? sanitizedInteraction.output_text : undefined;
+  const outputPage = outputTextValue !== undefined ? pageText(outputTextValue, offset) : undefined;
+
+  const result: Record<string, any> = {
+    taskId,
+    status,
+    done
+  };
+
+  if (outputPage) {
+    result.outputText = outputPage.text;
+  }
+
+  if (status === "failed") {
+    const errorDetails =
+      sanitizedInteraction.error?.message ||
+      sanitizedInteraction.output_text ||
+      JSON.stringify(sanitizedInteraction.error || "Interaction execution failed");
+    result.error = sanitizeSecret(String(errorDetails), apiKey).slice(0, MAX_TASK_ERROR_CHARS);
+  }
+
+  if (sanitizedInteraction?.usage !== undefined) {
+    result.usage = sanitizedInteraction.usage;
+  }
+
+  if (outputPage) {
+    result.truncated = outputPage.truncated;
+    result.totalChars = outputPage.totalChars;
+    if (outputPage.nextOffset !== undefined) {
+      result.nextOffset = outputPage.nextOffset;
+    }
+  }
+
+  if (status === "completed" && outputTextValue === undefined) {
+    const rawText = JSON.stringify(sanitizedInteraction);
+    const rawPage = pageText(rawText, offset);
+    result.rawFallback = rawPage.text;
+    result.truncated = rawPage.truncated;
+    result.totalChars = rawPage.totalChars;
+    if (rawPage.nextOffset !== undefined) {
+      result.nextOffset = rawPage.nextOffset;
+    }
+  }
+
+  if (includeRaw) {
+    const rawText = JSON.stringify(sanitizedInteraction);
+    result.raw = pageText(rawText, offset).text;
+  }
+
+  return JSON.stringify(result, null, 2);
+}
+
+function taskModeFromRepoContext(repoContext?: AntigravityRepositoryContext): AntigravityTaskIndexMode {
+  return repoContext?.mode ?? "plain";
+}
+
+function safeTaskPreview(task: string): string {
+  return typeof task === "string" ? task.slice(0, MAX_TASK_PREVIEW_CHARS) : "";
+}
+
+function safeTaskError(interaction: any, apiKey?: string): string | undefined {
+  if (!interaction || interaction.status !== "failed") return undefined;
+  const details =
+    interaction.error?.message ||
+    interaction.output_text ||
+    JSON.stringify(interaction.error || "Interaction execution failed");
+  return sanitizeSecret(String(details), apiKey).slice(0, MAX_TASK_ERROR_CHARS);
+}
+
+function warnTaskIndexFailure(reason: string): void {
+  console.warn(`Antigravity task index update skipped: ${reason}`);
+}
+
+export async function getTaskIndexRecord(
+  env: Env,
+  taskId: string
+): Promise<AntigravityTaskIndexRecord | null> {
+  try {
+    return await env.OAUTH_KV.get<AntigravityTaskIndexRecord>(taskIndexKey(taskId), {
+      type: "json"
+    });
+  } catch {
+    warnTaskIndexFailure("unable to read task record");
+    return null;
+  }
+}
+
+export async function putTaskIndexRecord(
+  env: Env,
+  record: AntigravityTaskIndexRecord
+): Promise<void> {
+  try {
+    await env.OAUTH_KV.put(taskIndexKey(record.taskId), JSON.stringify(record), {
+      expirationTtl: TASK_INDEX_TTL_SECONDS,
+      metadata: {
+        createdAt: record.createdAt,
+        status: record.status,
+        mode: record.mode,
+        taskPreview: record.taskPreview
+      }
+    });
+  } catch {
+    warnTaskIndexFailure("unable to write task record");
+  }
+}
+
+export async function indexNewInteraction(
+  env: Env,
+  interaction: any,
+  details: {
+    task: string;
+    mode: AntigravityTaskIndexMode;
+    repository?: string;
+    ref?: string;
+    pullRequest?: number;
+    apiKey?: string;
+  }
+): Promise<void> {
+  if (!env?.OAUTH_KV || !isValidTaskId(interaction?.id)) {
+    return;
+  }
+  const now = new Date().toISOString();
+  const record: AntigravityTaskIndexRecord = {
+    taskId: interaction.id,
+    createdAt: now,
+    updatedAt: now,
+    status: String(interaction.status),
+    mode: details.mode,
+    repository: details.repository,
+    ref: details.ref,
+    pullRequest: details.pullRequest,
+    taskPreview: safeTaskPreview(details.task),
+    lastError: safeTaskError(interaction, details.apiKey)
+  };
+  await putTaskIndexRecord(env, record);
+}
+
+export async function updateTaskIndexFromInteraction(
+  env: Env,
+  interaction: any,
+  apiKey?: string
+): Promise<void> {
+  if (!env?.OAUTH_KV || !isValidTaskId(interaction?.id)) {
+    return;
+  }
+  const existing = await getTaskIndexRecord(env, interaction.id);
+  if (!existing) {
+    return;
+  }
+  const nextStatus = String(interaction.status);
+  if (existing.status === nextStatus) {
+    return;
+  }
+  const updated: AntigravityTaskIndexRecord = {
+    ...existing,
+    status: nextStatus,
+    updatedAt: new Date().toISOString(),
+    lastError: safeTaskError(interaction, apiKey)
+  };
+  await putTaskIndexRecord(env, updated);
+}
+
+/**
+ * Legacy high-level API retained for compatibility.
+ */
 /**
  * Instantiates the MCP Server and registers Antigravity tools using SDK v2.
  */
@@ -660,6 +1061,126 @@ export function validateAndNormalizeRepoOptions(params: {
   };
 }
 
+const LONG_TASK_HINT =
+  "long tasks: call get_antigravity_task with the taskId until done is true";
+
+const TASK_TOOL_INPUT_PROPERTIES = {
+  task: z.string().describe("Instructions describing the software task, bug fix, or analysis required."),
+  contextFiles: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe("Key-value mapping of file paths to raw contents to initialize into the sandbox workspace."),
+  repository: z
+    .string()
+    .optional()
+    .describe("Target GitHub repository formatted as 'owner/repository'."),
+  ref: z
+    .string()
+    .optional()
+    .describe("Target Git ref (branch, tag, or commit SHA)."),
+  pullRequest: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Positive integer pull request number to inspect or review."),
+  baseBranch: z
+    .string()
+    .optional()
+    .describe("Target base branch for implementation."),
+  mode: z
+    .enum(["inspect", "review", "propose", "implement"])
+    .optional()
+    .describe("Operating mode. Defaults to 'inspect' (read-only). 'implement' grants controlled write access.")
+};
+
+function toolText(
+  text: string,
+  isError = false
+): { content: { type: "text"; text: string }[]; isError?: boolean } {
+  return {
+    content: [{ type: "text", text }],
+    ...(isError ? { isError: true } : {})
+  };
+}
+
+function formatTerminalTaskError(interaction: any, apiKey?: string): string {
+  const status = typeof interaction?.status === "string" ? interaction.status : "failed";
+  let reason: string;
+  if (status === "cancelled") {
+    reason = "Google Antigravity interaction cancelled.";
+  } else if (status === "incomplete") {
+    reason =
+      "Google Antigravity interaction incomplete: Agent budget or token limit reached before task completion.";
+  } else {
+    const details =
+      interaction?.error?.message ||
+      interaction?.output_text ||
+      JSON.stringify(interaction?.error || "Interaction execution failed");
+    reason = sanitizeSecret(String(details), apiKey);
+  }
+  const payload = {
+    taskId: typeof interaction?.id === "string" ? interaction.id : undefined,
+    status,
+    done: true,
+    error: reason.slice(0, MAX_TASK_ERROR_CHARS)
+  };
+  return JSON.stringify(payload, null, 2);
+}
+
+function toTaskArgs(args: {
+  task: string;
+  contextFiles?: Record<string, string>;
+  repository?: string;
+  ref?: string;
+  pullRequest?: number;
+  baseBranch?: string;
+  mode?: AntigravityTaskMode;
+}) {
+  const repoContext = validateAndNormalizeRepoOptions({
+    repository: args.repository,
+    ref: args.ref,
+    pullRequest: args.pullRequest,
+    baseBranch: args.baseBranch,
+    mode: args.mode
+  });
+  return { repoContext };
+}
+
+async function createAndIndexTask(
+  env: Env,
+  task: string,
+  contextFiles: Record<string, string> | undefined,
+  repoContext: AntigravityRepositoryContext | undefined
+): Promise<any> {
+  const interaction = await createInteraction(
+    env.GEMINI_API_KEY,
+    {
+      prompt: task,
+      workspaceFiles: contextFiles,
+      repoContext
+    },
+    env
+  );
+
+  if (!isValidTaskId(interaction?.id)) {
+    throw new Error(
+      "Google Antigravity API error: returned an invalid task id; expected 1-200 characters matching ^[A-Za-z0-9_-]{1,200}$."
+    );
+  }
+
+  await indexNewInteraction(env, interaction, {
+    task,
+    mode: taskModeFromRepoContext(repoContext),
+    repository: repoContext?.repository,
+    ref: repoContext?.ref,
+    pullRequest: repoContext?.pullRequest,
+    apiKey: env.GEMINI_API_KEY
+  });
+
+  return interaction;
+}
+
 /**
  * Instantiates the MCP Server and registers Antigravity tools using SDK v2.
  */
@@ -673,40 +1194,26 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
     "run_antigravity_agent",
     {
       description:
-        "Executes autonomous multi-step reasoning, test suites, or file transformations inside Google's Antigravity sandbox.",
+        "Executes autonomous multi-step reasoning, test suites, or file transformations inside Google's Antigravity sandbox. " +
+        "Creates a background task, waits briefly, and returns the result when finished. " +
+        `If the task is still running, ${LONG_TASK_HINT}.`,
       inputSchema: z.object({
-        task: z.string().describe("Instructions describing the software task, bug fix, or analysis required."),
-        contextFiles: z
-          .record(z.string(), z.string())
-          .optional()
-          .describe("Key-value mapping of file paths to raw contents to initialize into the sandbox workspace."),
-        repository: z
-          .string()
-          .optional()
-          .describe("Target GitHub repository formatted as 'owner/repository'."),
-        ref: z
-          .string()
-          .optional()
-          .describe("Target Git ref (branch, tag, or commit SHA)."),
-        pullRequest: z
+        ...TASK_TOOL_INPUT_PROPERTIES,
+        waitSeconds: z
           .number()
           .int()
-          .positive()
+          .min(0)
+          .max(90)
           .optional()
-          .describe("Positive integer pull request number to inspect or review."),
-        baseBranch: z
-          .string()
-          .optional()
-          .describe("Target base branch for implementation."),
-        mode: z
-          .enum(["inspect", "review", "propose", "implement"])
-          .optional()
-          .describe("Operating mode. Defaults to 'inspect' (read-only). 'implement' grants controlled write access.")
+          .default(45)
+          .describe("Seconds to wait for the task before returning an in-progress task id.")
       })
     },
-    async ({ task, contextFiles, repository, ref, pullRequest, baseBranch, mode }) => {
+    async ({ task, contextFiles, repository, ref, pullRequest, baseBranch, mode, waitSeconds }) => {
       try {
-        const repoContext = validateAndNormalizeRepoOptions({
+        const { repoContext } = toTaskArgs({
+          task,
+          contextFiles: contextFiles as Record<string, string> | undefined,
           repository,
           ref,
           pullRequest,
@@ -714,28 +1221,253 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
           mode
         });
 
-        const result = await callAntigravityAgent(
-          env.GEMINI_API_KEY,
+        let interaction = await createAndIndexTask(
+          env,
           task,
           contextFiles as Record<string, string> | undefined,
-          undefined,
-          repoContext,
-          env
+          repoContext
         );
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
+        interaction = await waitForInteraction(
+          env.GEMINI_API_KEY,
+          interaction,
+          (waitSeconds ?? 45) * 1000,
+          1000
+        );
+
+        await updateTaskIndexFromInteraction(env, interaction, env.GEMINI_API_KEY);
+
+        if (isTerminalInteractionStatus(interaction.status)) {
+          if (interaction.status === "completed") {
+            return toolText(formatTaskResult(interaction, { apiKey: env.GEMINI_API_KEY }));
+          }
+          return toolText(
+            formatTerminalTaskError(interaction, env.GEMINI_API_KEY),
+            true
+          );
+        }
+
+        const result: Record<string, any> = {
+          taskId: interaction.id,
+          status: interaction.status,
+          done: false,
+          message: `Task is still running. ${LONG_TASK_HINT}.`
         };
+        return toolText(JSON.stringify(result, null, 2));
       } catch (err: any) {
-        return {
-          content: [{ type: "text", text: `Error executing Antigravity task: ${err.message}` }],
-          isError: true
-        };
+        return toolText(
+          `Error executing Antigravity task: ${sanitizeSecret(String(err?.message || err), env.GEMINI_API_KEY)}`,
+          true
+        );
+      }
+    }
+  );
+
+  server.registerTool(
+    "start_antigravity_task",
+    {
+      description:
+        "Starts a long-running Antigravity task in the background and returns its taskId immediately. " +
+        `To collect the result, ${LONG_TASK_HINT}.`,
+      inputSchema: z.object(TASK_TOOL_INPUT_PROPERTIES)
+    },
+    async ({ task, contextFiles, repository, ref, pullRequest, baseBranch, mode }) => {
+      try {
+        const { repoContext } = toTaskArgs({
+          task,
+          contextFiles: contextFiles as Record<string, string> | undefined,
+          repository,
+          ref,
+          pullRequest,
+          baseBranch,
+          mode
+        });
+
+        const interaction = await createAndIndexTask(
+          env,
+          task,
+          contextFiles as Record<string, string> | undefined,
+          repoContext
+        );
+
+        return toolText(
+          JSON.stringify({ taskId: interaction.id, status: interaction.status, done: false }, null, 2)
+        );
+      } catch (err: any) {
+        return toolText(
+          `Error starting Antigravity task: ${sanitizeSecret(String(err?.message || err), env.GEMINI_API_KEY)}`,
+          true
+        );
+      }
+    }
+  );
+
+  server.registerTool(
+    "get_antigravity_task",
+    {
+      description:
+        "Fetches an Antigravity task, waiting briefly if it is still running, and returns its current status and output. " +
+        `For long tasks, ${LONG_TASK_HINT}.`,
+      inputSchema: z.object({
+        taskId: z.string().describe("Task id returned by start_antigravity_task or run_antigravity_agent."),
+        waitSeconds: z
+          .number()
+          .int()
+          .min(0)
+          .max(90)
+          .optional()
+          .default(20)
+          .describe("Seconds to wait for the task before returning its current state."),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Character offset for paging through long output text."),
+        includeRaw: z
+          .boolean()
+          .optional()
+          .describe("Include the sanitized raw interaction JSON.")
+      })
+    },
+    async ({ taskId, waitSeconds, offset, includeRaw }) => {
+      try {
+        const validTaskId = validateTaskId(taskId);
+        let interaction = await getInteraction(env.GEMINI_API_KEY, validTaskId);
+        interaction = await waitForInteraction(
+          env.GEMINI_API_KEY,
+          interaction,
+          (waitSeconds ?? 20) * 1000,
+          1000
+        );
+        await updateTaskIndexFromInteraction(env, interaction, env.GEMINI_API_KEY);
+        return toolText(
+          formatTaskResult(interaction, {
+            offset,
+            includeRaw,
+            apiKey: env.GEMINI_API_KEY
+          })
+        );
+      } catch (err: any) {
+        return toolText(
+          `Error fetching Antigravity task: ${sanitizeSecret(String(err?.message || err), env.GEMINI_API_KEY)}`,
+          true
+        );
+      }
+    }
+  );
+
+  server.registerTool(
+    "cancel_antigravity_task",
+    {
+      description:
+        "Cancels a background Antigravity task. Cancelling an already-finished task returns its current status. " +
+        `For long tasks, ${LONG_TASK_HINT}.`,
+      inputSchema: z.object({
+        taskId: z.string().describe("Task id returned by start_antigravity_task or run_antigravity_agent.")
+      })
+    },
+    async ({ taskId }) => {
+      try {
+        const validTaskId = validateTaskId(taskId);
+        const interaction = await cancelInteraction(env.GEMINI_API_KEY, validTaskId);
+        await updateTaskIndexFromInteraction(env, interaction, env.GEMINI_API_KEY);
+        return toolText(formatTaskResult(interaction, { apiKey: env.GEMINI_API_KEY }));
+      } catch (err: any) {
+        return toolText(
+          `Error cancelling Antigravity task: ${sanitizeSecret(String(err?.message || err), env.GEMINI_API_KEY)}`,
+          true
+        );
+      }
+    }
+  );
+
+  server.registerTool(
+    "list_antigravity_tasks",
+    {
+      description:
+        "Lists indexed Antigravity tasks newest first. Statuses are as of the last time each task was fetched. " +
+        `For long tasks, ${LONG_TASK_HINT}.`,
+      inputSchema: z.object({
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .default(20)
+          .describe("Maximum number of tasks to return."),
+        status: z
+          .string()
+          .optional()
+          .describe("Optional status filter (for example in_progress, completed, failed, cancelled).")
+      })
+    },
+    async ({ limit, status }) => {
+      try {
+        const wantedLimit = limit ?? 20;
+        const keys: any[] = [];
+        let cursor: string | undefined;
+        let scanned = 0;
+        let listFailed = false;
+
+        do {
+          let page: any;
+          try {
+            page = await env.OAUTH_KV.list({
+              prefix: TASK_INDEX_PREFIX,
+              cursor,
+              limit: 1000
+            });
+          } catch {
+            warnTaskIndexFailure("unable to list task records");
+            listFailed = true;
+            break;
+          }
+
+          const pageKeys = Array.isArray(page?.keys) ? page.keys : [];
+          for (const key of pageKeys) {
+            keys.push(key);
+            scanned++;
+            if (scanned >= 1000) break;
+          }
+          cursor = page?.cursor;
+          if (scanned >= 1000) break;
+        } while (cursor);
+
+        if (listFailed) {
+          return toolText(JSON.stringify({ tasks: [] }, null, 2));
+        }
+
+        const items = keys
+          .map((key) => {
+            const metadata = key?.metadata && typeof key.metadata === "object" ? key.metadata : {};
+            const name = typeof key?.name === "string" ? key.name : "";
+            return {
+              taskId: name.startsWith(TASK_INDEX_PREFIX)
+                ? name.slice(TASK_INDEX_PREFIX.length)
+                : name,
+              status: typeof metadata.status === "string" ? metadata.status : "unknown",
+              createdAt: typeof metadata.createdAt === "string" ? metadata.createdAt : "",
+              mode: typeof metadata.mode === "string" ? metadata.mode : "plain",
+              taskPreview:
+                typeof metadata.taskPreview === "string" ? metadata.taskPreview : ""
+            };
+          })
+          .filter((item) => !status || item.status === status)
+          .sort((a, b) => {
+            const aTime = Date.parse(a.createdAt);
+            const bTime = Date.parse(b.createdAt);
+            return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+          })
+          .slice(0, wantedLimit);
+
+        return toolText(JSON.stringify({ tasks: items }, null, 2));
+      } catch (err: any) {
+        return toolText(
+          `Error listing Antigravity tasks: ${sanitizeSecret(String(err?.message || err), env.GEMINI_API_KEY)}`,
+          true
+        );
       }
     }
   );
