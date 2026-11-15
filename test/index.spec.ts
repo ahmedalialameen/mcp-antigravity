@@ -188,6 +188,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const headers = new Headers(calledInit?.headers);
       expect(headers.get("x-goog-api-key")).toBe(fakeApiKey);
       expect(headers.get("Content-Type")).toBe("application/json");
+      expect(headers.get("Api-Revision")).toBe("2026-05-20");
 
       const payload = JSON.parse(calledInit?.body as string);
       expect(payload).toEqual({
@@ -549,6 +550,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(payload.background).toBe(true);
       expect(payload.store).toBe(true);
       expect(new Headers(init?.headers).get("x-goog-api-key")).toBe("test-key");
+      expect(new Headers(init?.headers).get("Api-Revision")).toBe("2026-05-20");
     });
 
     it("run_antigravity_agent returns completed text and a non-error in-progress task", async () => {
@@ -689,8 +691,10 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
     it("get_antigravity_task polls in_progress to completed", async () => {
       const handler = await makeHandler();
       let call = 0;
-      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      let getHeaders: Headers | undefined;
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
         call++;
+        getHeaders = new Headers(init?.headers);
         if (call === 1) {
           return Response.json({ id: "int-get-poll", status: "in_progress" }, { status: 200 });
         }
@@ -706,6 +710,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       });
 
       expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(getHeaders?.get("Api-Revision")).toBe("2026-05-20");
       expect(result.isError).toBe(false);
       expect(result.data.status).toBe("completed");
       expect(result.data.done).toBe(true);
@@ -741,11 +746,13 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const handler = await makeHandler();
       let cancelMethod = "";
       let cancelUrl = "";
+      let cancelHeaders: Headers | undefined;
       vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
         const urlStr = String(url);
         if (urlStr.includes("int-cancel-running/cancel")) {
           cancelUrl = urlStr;
           cancelMethod = String(init?.method);
+          cancelHeaders = new Headers(init?.headers);
           return Response.json({ id: "int-cancel-running", status: "cancelled" }, { status: 200 });
         }
         if (urlStr.includes("int-cancel-finished/cancel")) {
@@ -761,6 +768,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         "https://generativelanguage.googleapis.com/v1beta/interactions/int-cancel-running/cancel"
       );
       expect(cancelMethod).toBe("POST");
+      expect(cancelHeaders?.get("Api-Revision")).toBe("2026-05-20");
       expect(running.isError).toBe(false);
       expect(running.data.status).toBe("cancelled");
 
@@ -4976,6 +4984,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         const headers = new Headers(init?.headers);
         expect(headers.get("x-goog-api-key")).toBe("admin-page-gemini-api-key");
         expect(headers.get("Content-Type")).toBe("application/json");
+        expect(headers.get("Api-Revision")).toBeNull();
         expect(JSON.parse(init?.body as string)).toEqual({
           id: `antigravity-github-${slot}`,
           type: "bearer_token",
@@ -5186,6 +5195,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         expect(new Headers(init?.headers).get("x-goog-api-key")).toBe(
           "admin-page-gemini-api-key"
         );
+        expect(new Headers(init?.headers).get("Api-Revision")).toBeNull();
         expect(await env.OAUTH_KV.get(`${CREDENTIAL_KV_PREFIX}read`)).toBeNull();
 
         vi.restoreAllMocks();
