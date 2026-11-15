@@ -4716,7 +4716,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(tooLarge.status).toBe(413);
     });
 
-    it("renders status, allowed repositories, and all forms with a CSRF nonce and security headers", async () => {
+    it("renders only forms on GET and hides configured status and allowed repositories", async () => {
       await env.OAUTH_KV.put(
         `${CREDENTIAL_KV_PREFIX}read`,
         JSON.stringify({
@@ -4740,10 +4740,12 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
 
       expect(csrfToken).toBeTruthy();
-      expect(html).toContain("read: configured (2024-05-06)");
-      expect(html).toContain("write: not configured");
-      expect(html).toContain("owner/repo");
-      expect(html).toContain("other/repo");
+      expect(html).not.toContain("<h2>Status</h2>");
+      expect(html).not.toContain("configured");
+      expect(html).not.toContain("owner/repo");
+      expect(html).not.toContain("other/repo");
+      expect(html).not.toContain("No repositories allowed.");
+      expect(html).toContain('name="action" value="status"');
       expect(html).toContain('name="action" value="save"');
       expect(html).toContain('name="action" value="delete"');
       expect(html).toContain('name="action" value="repos"');
@@ -4755,6 +4757,42 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(html).toContain('autocomplete="off"');
       expect(html).not.toContain("ghp_");
       expect(html).not.toContain("github_pat_");
+    });
+
+    it("shows status and allowed repositories only after the passphrase is verified", async () => {
+      await env.OAUTH_KV.put(
+        `${CREDENTIAL_KV_PREFIX}read`,
+        JSON.stringify({
+          id: "antigravity-github-read",
+          savedAt: "2024-05-06T12:34:56.000Z"
+        })
+      );
+      await env.OAUTH_KV.put(
+        ALLOWED_REPOSITORIES_KV_KEY,
+        JSON.stringify(["Owner/Repo", "other/repo"])
+      );
+      const envUnderTest = adminEnv();
+
+      const wrong = await postAction(envUnderTest, {
+        action: "status",
+        owner_passphrase: "definitely-the-wrong-status-passphrase"
+      });
+      expect(wrong.status).toBe(400);
+      const wrongText = await wrong.text();
+      expect(wrongText).not.toContain("read: configured");
+      expect(wrongText).not.toContain("owner/repo");
+      expect(wrongText).not.toContain("other/repo");
+
+      const right = await postAction(envUnderTest, {
+        action: "status",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(right.status).toBe(200);
+      const rightText = await right.text();
+      expect(rightText).toContain("read: configured (2024-05-06)");
+      expect(rightText).toContain("write: not configured");
+      expect(rightText).toContain("owner/repo");
+      expect(rightText).toContain("other/repo");
     });
 
     it("rejects wrong passphrases, bad nonces, and malformed input with the same generic 400", async () => {
@@ -5011,6 +5049,50 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
     });
 
+    it("removes the stored KV record when recreating a replaced credential fails", async () => {
+      const token = "ghp_ADMIN_RECREATE_FAIL_TOKEN_MARKER_1234567890";
+      const failureModes: Array<() => Promise<Response>> = [
+        async () => {
+          throw new Error("network down");
+        },
+        async () => new Response("", { status: 500 })
+      ];
+
+      for (const failRecreate of failureModes) {
+        await env.OAUTH_KV.put(
+          `${CREDENTIAL_KV_PREFIX}write`,
+          JSON.stringify({
+            id: "antigravity-github-write",
+            savedAt: "2024-05-06T12:34:56.000Z"
+          })
+        );
+
+        let createAttempts = 0;
+        vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+          if (init?.method === "DELETE") {
+            return new Response(null, { status: 204 });
+          }
+          createAttempts++;
+          if (createAttempts === 1) {
+            return new Response("", { status: 409 });
+          }
+          return failRecreate();
+        });
+
+        const res = await postAction(adminEnv(), {
+          action: "save",
+          slot: "write",
+          token,
+          replace: "1",
+          owner_passphrase: ownerPassphrase
+        });
+        expect(res.status).toBe(502);
+        expect(await env.OAUTH_KV.get(`${CREDENTIAL_KV_PREFIX}write`)).toBeNull();
+
+        vi.restoreAllMocks();
+      }
+    });
+
     it("deletes the fixed Google credential and removes the KV record, treating not-found as success", async () => {
       for (const status of [204, 404]) {
         await env.OAUTH_KV.put(
@@ -5097,6 +5179,38 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       });
       expect(cleared.status).toBe(200);
       expect(await env.OAUTH_KV.get(ALLOWED_REPOSITORIES_KV_KEY, { type: "json" })).toEqual([]);
+    });
+
+    it("refuses repository updates and notes the source when ALLOWED_REPOSITORIES is set", async () => {
+      await env.OAUTH_KV.put(
+        ALLOWED_REPOSITORIES_KV_KEY,
+        JSON.stringify(["kv-only/repo"])
+      );
+      const envUnderTest = adminEnv({ ALLOWED_REPOSITORIES: "env-owner/env-repo" });
+
+      const status = await postAction(envUnderTest, {
+        action: "status",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(status.status).toBe(200);
+      const statusText = await status.text();
+      expect(statusText).toContain(
+        "Allowed repositories are set by an environment variable."
+      );
+      expect(statusText).not.toContain("kv-only/repo");
+
+      const rejected = await postAction(envUnderTest, {
+        action: "repos",
+        repositories: "new-owner/new-repo",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(rejected.status).toBe(400);
+      expect(await rejected.text()).toContain(
+        "Allowed repositories are set by an environment variable."
+      );
+      expect(JSON.parse((await env.OAUTH_KV.get(ALLOWED_REPOSITORIES_KV_KEY))!)).toEqual([
+        "kv-only/repo"
+      ]);
     });
 
     it("prefers environment credential ids over KV, falls back to KV, and fails closed when neither exists", async () => {

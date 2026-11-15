@@ -2649,10 +2649,11 @@ function adminField(form: FormData, ...names: string[]): string {
   return "";
 }
 
-function normalizeAdminAction(raw: string): "save" | "delete" | "repos" | "" {
+function normalizeAdminAction(raw: string): "save" | "delete" | "repos" | "status" | "" {
   const action = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
   if (action === "save" || action === "save_credential") return "save";
   if (action === "delete" || action === "delete_credential") return "delete";
+  if (action === "status" || action === "show_status") return "status";
   if (
     action === "repos" ||
     action === "repositories" ||
@@ -2826,6 +2827,11 @@ async function saveAdminCredential(
 
     response = await createCredential();
     if (!response) {
+      try {
+        await env.OAUTH_KV.delete(credentialKvKey(slot));
+      } catch {
+        // Best effort cleanup; the original error is reported below.
+      }
       return {
         result: "error",
         status: 502,
@@ -2835,6 +2841,13 @@ async function saveAdminCredential(
   }
 
   if (!response.ok) {
+    if (alreadyExists) {
+      try {
+        await env.OAUTH_KV.delete(credentialKvKey(slot));
+      } catch {
+        // Best effort cleanup; the original error is reported below.
+      }
+    }
     return {
       result: "error",
       status: 502,
@@ -2897,6 +2910,14 @@ async function setAdminRepositories(
   env: Env,
   raw: string
 ): Promise<AdminActionResult> {
+  if (typeof env.ALLOWED_REPOSITORIES === "string") {
+    return {
+      result: "rejected",
+      status: 400,
+      message: "Allowed repositories are set by an environment variable."
+    };
+  }
+
   const parsed = parseAdminRepositories(raw);
   if (!parsed.ok) {
     return { result: "rejected", status: 400, message: "Invalid repository list." };
@@ -2926,7 +2947,7 @@ async function setAdminRepositories(
 }
 
 function logAdminAction(
-  action: "save" | "delete" | "repos",
+  action: "save" | "delete" | "repos" | "status",
   slot: CredentialSlot | "-",
   result: "ok" | "rejected" | "error",
   status: number
@@ -2940,18 +2961,26 @@ async function renderAdminCredentialsPage(
   env: Env,
   config: OwnerPassphraseConfig,
   message?: string,
-  status = 200
+  status = 200,
+  showStatus = false
 ): Promise<Response> {
   const csrfSecret = env.CONSENT_CSRF_SECRET;
   if (!csrfSecret) {
     return adminMessageResponse("Server configuration error.", 500);
   }
 
-  const [readRecord, writeRecord, allowedRepositories] = await Promise.all([
-    readStoredCredential(env, "read"),
-    readStoredCredential(env, "write"),
-    getAllowedRepositories(env)
-  ]);
+  let readRecord: StoredCredentialRecord | null = null;
+  let writeRecord: StoredCredentialRecord | null = null;
+  let allowedRepositories: string[] = [];
+  let repositoriesFromEnv = false;
+  if (showStatus) {
+    [readRecord, writeRecord, allowedRepositories] = await Promise.all([
+      readStoredCredential(env, "read"),
+      readStoredCredential(env, "write"),
+      getAllowedRepositories(env)
+    ]);
+    repositoriesFromEnv = typeof env.ALLOWED_REPOSITORIES === "string";
+  }
   const csrfToken = await createConsentCsrfToken(
     ADMIN_CSRF_CLIENT_ID,
     ADMIN_CSRF_REDIRECT_URI,
@@ -2966,12 +2995,23 @@ async function renderAdminCredentialsPage(
     return date ? `${slot}: configured (${date})` : `${slot}: configured`;
   };
 
-  const repositoriesHtml =
-    allowedRepositories.length > 0
+  const repositoriesHtml = repositoriesFromEnv
+    ? "<p>Allowed repositories are set by an environment variable.</p>"
+    : allowedRepositories.length > 0
       ? `<ul>${allowedRepositories
           .map((repository) => `<li>${escapeHtml(repository)}</li>`)
           .join("")}</ul>`
       : "<p>No repositories allowed.</p>";
+
+  const statusHtml = showStatus
+    ? `<h2>Status</h2>
+    <ul>
+      <li>${escapeHtml(credentialStatus("read", readRecord))}</li>
+      <li>${escapeHtml(credentialStatus("write", writeRecord))}</li>
+    </ul>
+    <h2>Allowed repositories</h2>
+    ${repositoriesHtml}`
+    : "";
 
   const safeMessage = message ? `<p class="result">${escapeHtml(message)}</p>` : "";
   const safeCsrfToken = escapeHtml(csrfToken);
@@ -2996,13 +3036,15 @@ async function renderAdminCredentialsPage(
   <main>
     <h1>Admin credentials</h1>
     ${safeMessage}
-    <h2>Status</h2>
-    <ul>
-      <li>${escapeHtml(credentialStatus("read", readRecord))}</li>
-      <li>${escapeHtml(credentialStatus("write", writeRecord))}</li>
-    </ul>
-    <h2>Allowed repositories</h2>
-    ${repositoriesHtml}
+    ${statusHtml}
+
+    <form method="POST" action="${ADMIN_CREDENTIALS_PATH}" autocomplete="off">
+      <h2>Show status</h2>
+      <input type="hidden" name="csrf_token" value="${safeCsrfToken}">
+      <label for="status_passphrase">Owner passphrase</label>
+      <input type="password" id="status_passphrase" name="owner_passphrase" autocomplete="off" required>
+      <button type="submit" name="action" value="status">Show status</button>
+    </form>
 
     <form method="POST" action="${ADMIN_CREDENTIALS_PATH}" autocomplete="off">
       <h2>Save credential</h2>
@@ -3036,7 +3078,7 @@ async function renderAdminCredentialsPage(
     <form method="POST" action="${ADMIN_CREDENTIALS_PATH}" autocomplete="off">
       <h2>Set allowed repositories</h2>
       <input type="hidden" name="csrf_token" value="${safeCsrfToken}">
-      <label for="repositories">Allowed repositories (one owner/repo per line)</label>
+      <label for="repositories">Allowed repositories (one per line)</label>
       <textarea id="repositories" name="repositories" autocomplete="off"></textarea>
       <label for="repos_passphrase">Owner passphrase</label>
       <input type="password" id="repos_passphrase" name="owner_passphrase" autocomplete="off" required>
@@ -3151,7 +3193,7 @@ async function handleAdminCredentialsRequest(request: Request, env: Env): Promis
       return adminMessageResponse("Invalid request", 400);
     }
     slot = slotValue;
-  } else if (action !== "repos") {
+  } else if (action !== "repos" && action !== "status") {
     return adminMessageResponse("Invalid request", 400);
   }
 
@@ -3171,6 +3213,9 @@ async function handleAdminCredentialsRequest(request: Request, env: Env): Promis
   } else if (action === "delete" && slot) {
     actionResult = await deleteAdminCredential(env, slot);
     logAdminAction("delete", slot, actionResult.result, actionResult.status);
+  } else if (action === "status") {
+    actionResult = { result: "ok", status: 200, message: "Status." };
+    logAdminAction("status", "-", actionResult.result, actionResult.status);
   } else {
     const repositories = adminField(
       form,
@@ -3186,7 +3231,8 @@ async function handleAdminCredentialsRequest(request: Request, env: Env): Promis
     env,
     config,
     sanitizeSecret(sanitizeSecret(actionResult.message, env.GEMINI_API_KEY), submittedToken),
-    actionResult.status
+    actionResult.status,
+    true
   );
 }
 
