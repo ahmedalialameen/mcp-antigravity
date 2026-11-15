@@ -19,6 +19,7 @@ export interface Env {
   ALLOWED_HOSTS?: string;
   GITHUB_MCP_READ_CREDENTIAL_ID?: string;
   GITHUB_MCP_WRITE_CREDENTIAL_ID?: string;
+  ALLOWED_REPOSITORIES?: string;
 }
 
 export type AntigravityTaskMode = "inspect" | "review" | "propose" | "implement";
@@ -383,13 +384,89 @@ export function taskRecentIndexKey(createdAt: string, taskId: string): string {
   return `${TASK_RECENT_INDEX_PREFIX}${reverseTs}:${taskId}`;
 }
 
-function buildInteractionPayload(
+export const ADMIN_CREDENTIALS_PATH = "/admin/credentials";
+export const CREDENTIAL_KV_PREFIX = "antigravity:config:credential:";
+export const ALLOWED_REPOSITORIES_KV_KEY = "antigravity:config:allowed-repositories";
+
+export type CredentialSlot = "read" | "write";
+
+export const ADMIN_CREDENTIAL_IDS: Record<CredentialSlot, string> = {
+  read: "antigravity-github-read",
+  write: "antigravity-github-write"
+};
+
+function credentialKvKey(slot: CredentialSlot): string {
+  return `${CREDENTIAL_KV_PREFIX}${slot}`;
+}
+
+function normalizeAllowedRepositoryList(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+/**
+ * Resolves the effective repository allowlist. An explicitly configured
+ * environment variable wins; otherwise the KV list is used. Missing values and
+ * KV failures deny every repository (fail closed).
+ */
+export async function getAllowedRepositories(env?: Env): Promise<string[]> {
+  if (!env) return [];
+
+  if (typeof env.ALLOWED_REPOSITORIES === "string") {
+    return normalizeAllowedRepositoryList(env.ALLOWED_REPOSITORIES.split(","));
+  }
+
+  try {
+    const stored = await env.OAUTH_KV.get(ALLOWED_REPOSITORIES_KV_KEY, { type: "json" });
+    if (!Array.isArray(stored)) return [];
+    return normalizeAllowedRepositoryList(
+      stored.filter((value): value is string => typeof value === "string")
+    );
+  } catch {
+    return [];
+  }
+}
+
+export async function resolveCredentialId(env: Env | undefined, slot: CredentialSlot): Promise<string> {
+  const envName =
+    slot === "write" ? "GITHUB_MCP_WRITE_CREDENTIAL_ID" : "GITHUB_MCP_READ_CREDENTIAL_ID";
+  const envValue = slot === "write"
+    ? env?.GITHUB_MCP_WRITE_CREDENTIAL_ID
+    : env?.GITHUB_MCP_READ_CREDENTIAL_ID;
+
+  if (typeof envValue === "string" && envValue.trim() !== "") {
+    return validateCredentialId(envValue, envName);
+  }
+
+  let recordId: string | undefined;
+  try {
+    const record = await env?.OAUTH_KV.get<{ id?: unknown }>(credentialKvKey(slot), {
+      type: "json"
+    });
+    if (record && typeof record.id === "string") {
+      recordId = record.id;
+    }
+  } catch {
+    recordId = undefined;
+  }
+
+  return validateCredentialId(recordId, envName);
+}
+
+async function buildInteractionPayload(
   prompt: string,
   workspaceFiles?: Record<string, string>,
   repoContext?: AntigravityRepositoryContext,
   env?: Env,
   settings?: { background?: boolean; store?: boolean; storeOption?: boolean }
-): Record<string, any> {
+): Promise<Record<string, any>> {
   const sources = validateWorkspaceFiles(workspaceFiles);
 
   const payload: Record<string, any> = {
@@ -419,19 +496,19 @@ function buildInteractionPayload(
   }
 
   if (repoContext) {
-    // 1. Resolve and validate Google-managed credential ID
-    let credId: string;
-    if (repoContext.mode === "implement") {
-      credId = validateCredentialId(
-        env?.GITHUB_MCP_WRITE_CREDENTIAL_ID,
-        "GITHUB_MCP_WRITE_CREDENTIAL_ID"
-      );
-    } else {
-      credId = validateCredentialId(
-        env?.GITHUB_MCP_READ_CREDENTIAL_ID,
-        "GITHUB_MCP_READ_CREDENTIAL_ID"
+    // 1. Enforce the repository allowlist before any credential lookup or Google call.
+    const allowedRepositories = await getAllowedRepositories(env);
+    if (!allowedRepositories.includes(repoContext.repository.trim().toLowerCase())) {
+      throw new Error(
+        `Repository '${repoContext.repository}' is not allowed. Configure allowed repositories at ${ADMIN_CREDENTIALS_PATH}.`
       );
     }
+
+    // 2. Resolve and validate Google-managed credential ID
+    const credId = await resolveCredentialId(
+      env,
+      repoContext.mode === "implement" ? "write" : "read"
+    );
 
     // 2. Configure tool restrictions and remote headers
     let allowedTools: string[];
@@ -577,7 +654,7 @@ export async function createInteraction(
   }
 
   const timeoutMs = payloadInputs.timeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS;
-  const payload = buildInteractionPayload(
+  const payload = await buildInteractionPayload(
     prompt,
     payloadInputs.workspaceFiles,
     payloadInputs.repoContext,
@@ -743,7 +820,7 @@ export async function callAntigravityAgent(
   const maxPollTimeMs = options?.maxPollTimeMs ?? 120000;
   const pollIntervalMs = options?.maxPollIntervalMs ?? 1000;
 
-  const payload = buildInteractionPayload(prompt, workspaceFiles, repoContext, env, {
+  const payload = await buildInteractionPayload(prompt, workspaceFiles, repoContext, env, {
     storeOption: options?.store
   });
 
@@ -887,34 +964,41 @@ function previewStepValue(value: any, maxChars: number, apiKey?: string): string
   return truncateCharacters(sanitizeSecret(text ?? "", apiKey), maxChars);
 }
 
-function compactInteractionSteps(steps: any, apiKey?: string): any[] {
-  if (!Array.isArray(steps)) return [];
-  const compact: any[] = [];
-  for (const step of steps) {
-    if (compact.length >= MAX_COMPACT_STEPS) break;
-    if (!step || typeof step !== "object" || step.type === "thought") continue;
-    compact.push({
-      type: typeof step.type === "string" ? step.type : "",
-      name: typeof step.name === "string" ? step.name : "",
-      is_error:
-        step.is_error === true ||
-        step.isError === true ||
-        (step.result !== null &&
-          typeof step.result === "object" &&
-          step.result.isError === true),
-      argsPreview: previewStepValue(
-        step.arguments ?? step.args,
-        MAX_STEP_ARGS_PREVIEW_CHARS,
-        apiKey
-      ),
-      resultPreview: previewStepValue(
-        step.result ?? step.output ?? step.content ?? step.text,
-        MAX_STEP_RESULT_PREVIEW_CHARS,
-        apiKey
-      )
-    });
-  }
-  return compact;
+function compactInteractionSteps(
+  steps: any,
+  apiKey?: string
+): { steps: any[]; omittedSteps: number } {
+  if (!Array.isArray(steps)) return { steps: [], omittedSteps: 0 };
+
+  const nonThoughtSteps = steps.filter(
+    (step) => step && typeof step === "object" && step.type !== "thought"
+  );
+  const omittedSteps = Math.max(0, nonThoughtSteps.length - MAX_COMPACT_STEPS);
+  const selectedSteps =
+    omittedSteps > 0 ? nonThoughtSteps.slice(-MAX_COMPACT_STEPS) : nonThoughtSteps;
+
+  const compact = selectedSteps.map((step) => ({
+    type: typeof step.type === "string" ? step.type : "",
+    name: typeof step.name === "string" ? step.name : "",
+    is_error:
+      step.is_error === true ||
+      step.isError === true ||
+      (step.result !== null &&
+        typeof step.result === "object" &&
+        step.result.isError === true),
+    argsPreview: previewStepValue(
+      step.arguments ?? step.args,
+      MAX_STEP_ARGS_PREVIEW_CHARS,
+      apiKey
+    ),
+    resultPreview: previewStepValue(
+      step.result ?? step.output ?? step.content ?? step.text,
+      MAX_STEP_RESULT_PREVIEW_CHARS,
+      apiKey
+    )
+  }));
+
+  return { steps: compact, omittedSteps };
 }
 
 function pageText(
@@ -1003,7 +1087,11 @@ export function formatTaskResult(
   }
 
   if (includeSteps) {
-    result.steps = compactInteractionSteps(sanitizedInteraction?.steps, apiKey);
+    const compacted = compactInteractionSteps(sanitizedInteraction?.steps, apiKey);
+    result.steps = compacted.steps;
+    if (compacted.omittedSteps > 0) {
+      result.omittedSteps = compacted.omittedSteps;
+    }
   }
 
   return JSON.stringify(result, null, 2);
@@ -2500,6 +2588,654 @@ export async function verifyConsentCsrfToken(
   );
 }
 
+const ADMIN_CSRF_CLIENT_ID = "admin-credentials";
+const ADMIN_CSRF_REDIRECT_URI = ADMIN_CREDENTIALS_PATH;
+const ADMIN_MAX_BODY_BYTES = 8 * 1024;
+const ADMIN_TOKEN_MIN_LENGTH = 20;
+const ADMIN_TOKEN_MAX_LENGTH = 255;
+const ADMIN_MAX_REPOSITORIES = 50;
+const ADMIN_REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+const ADMIN_GOOGLE_CREDENTIALS_URL =
+  "https://generativelanguage.googleapis.com/v1beta/credentials";
+const ADMIN_GOOGLE_TIMEOUT_MS = 15000;
+const ADMIN_CONTENT_SECURITY_POLICY =
+  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+interface AdminActionResult {
+  result: "ok" | "rejected" | "error";
+  status: number;
+  message: string;
+}
+
+interface StoredCredentialRecord {
+  id?: unknown;
+  savedAt?: unknown;
+}
+
+function adminResponse(html: string, status = 200): Response {
+  return new Response(html, {
+    status,
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "text/html; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": ADMIN_CONTENT_SECURITY_POLICY
+    }
+  });
+}
+
+function adminMessageResponse(message: string, status: number): Response {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Admin credentials</title>
+</head>
+<body>
+  <p>${escapeHtml(message)}</p>
+</body>
+</html>`;
+  return adminResponse(html, status);
+}
+
+function adminField(form: FormData, ...names: string[]): string {
+  for (const name of names) {
+    const value = form.get(name);
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function normalizeAdminAction(raw: string): "save" | "delete" | "repos" | "status" | "" {
+  const action = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (action === "save" || action === "save_credential") return "save";
+  if (action === "delete" || action === "delete_credential") return "delete";
+  if (action === "status" || action === "show_status") return "status";
+  if (
+    action === "repos" ||
+    action === "repositories" ||
+    action === "set_repositories" ||
+    action === "allowed_repositories" ||
+    action === "set_allowed_repositories"
+  ) {
+    return "repos";
+  }
+  return "";
+}
+
+function adminSavedDate(savedAt: unknown): string {
+  if (typeof savedAt !== "string") return "";
+  const match = /^\d{4}-\d{2}-\d{2}/.exec(savedAt);
+  return match ? match[0] : "";
+}
+
+async function readStoredCredential(
+  env: Env,
+  slot: CredentialSlot
+): Promise<StoredCredentialRecord | null> {
+  try {
+    const record = await env.OAUTH_KV.get<StoredCredentialRecord>(credentialKvKey(slot), {
+      type: "json"
+    });
+    return record && typeof record === "object" ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+function isValidAdminGithubToken(token: string): boolean {
+  if (
+    token.length < ADMIN_TOKEN_MIN_LENGTH ||
+    token.length > ADMIN_TOKEN_MAX_LENGTH
+  ) {
+    return false;
+  }
+  if (/[\s\u0000-\u001f\u007f-\u009f]/.test(token)) {
+    return false;
+  }
+  return token.startsWith("github_pat_") || token.startsWith("ghp_");
+}
+
+function parseAdminRepositories(raw: string): { ok: true; repositories: string[] } | { ok: false } {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  if (lines.length > ADMIN_MAX_REPOSITORIES) {
+    return { ok: false };
+  }
+
+  const repositories: string[] = [];
+  const seen = new Set<string>();
+  for (const line of lines) {
+    if (!ADMIN_REPOSITORY_PATTERN.test(line)) {
+      return { ok: false };
+    }
+    const normalized = line.toLowerCase();
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      repositories.push(normalized);
+    }
+  }
+
+  return { ok: true, repositories };
+}
+
+async function deleteGoogleCredential(
+  env: Env,
+  id: string
+): Promise<{ ok: boolean; notFound: boolean; networkError: boolean; status: number }> {
+  try {
+    const response = await fetch(
+      `${ADMIN_GOOGLE_CREDENTIALS_URL}/${encodeURIComponent(id)}`,
+      {
+        method: "DELETE",
+        headers: { "x-goog-api-key": env.GEMINI_API_KEY },
+        signal: AbortSignal.timeout(ADMIN_GOOGLE_TIMEOUT_MS)
+      }
+    );
+    return {
+      ok: response.ok,
+      notFound: response.status === 404,
+      networkError: false,
+      status: response.status
+    };
+  } catch {
+    return { ok: false, notFound: false, networkError: true, status: 0 };
+  }
+}
+
+async function saveAdminCredential(
+  env: Env,
+  slot: CredentialSlot,
+  rawToken: string,
+  replaceExisting: boolean
+): Promise<AdminActionResult> {
+  const token = rawToken.trim();
+  if (!isValidAdminGithubToken(token)) {
+    return { result: "rejected", status: 400, message: "Invalid GitHub token." };
+  }
+
+  const id = ADMIN_CREDENTIAL_IDS[slot];
+  const requestBody = JSON.stringify({ id, type: "bearer_token", token });
+
+  const createCredential = async (): Promise<Response | null> => {
+    try {
+      return await fetch(ADMIN_GOOGLE_CREDENTIALS_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": env.GEMINI_API_KEY
+        },
+        body: requestBody,
+        signal: AbortSignal.timeout(ADMIN_GOOGLE_TIMEOUT_MS)
+      });
+    } catch {
+      return null;
+    }
+  };
+
+  let response = await createCredential();
+  if (!response) {
+    return {
+      result: "error",
+      status: 502,
+      message: "Google credentials request failed or timed out."
+    };
+  }
+
+  let alreadyExists = response.status === 409;
+  if (!alreadyExists && !response.ok) {
+    try {
+      const bodyText = await response.text();
+      if (bodyText.includes("ALREADY_EXISTS")) {
+        alreadyExists = true;
+      }
+    } catch {
+      // Google's body is never shown; failure to inspect it is not fatal here.
+    }
+  }
+
+  if (alreadyExists) {
+    if (!replaceExisting) {
+      return {
+        result: "rejected",
+        status: 200,
+        message: "Credential already exists, tick replace."
+      };
+    }
+
+    const deletion = await deleteGoogleCredential(env, id);
+    if (deletion.networkError) {
+      return {
+        result: "error",
+        status: 502,
+        message: "Google credentials request failed or timed out."
+      };
+    }
+    if (!deletion.ok && !deletion.notFound) {
+      return {
+        result: "error",
+        status: 502,
+        message: `Google credentials delete failed (HTTP ${deletion.status}).`
+      };
+    }
+
+    response = await createCredential();
+    if (!response) {
+      try {
+        await env.OAUTH_KV.delete(credentialKvKey(slot));
+      } catch {
+        // Best effort cleanup; the original error is reported below.
+      }
+      return {
+        result: "error",
+        status: 502,
+        message: "Google credentials request failed or timed out."
+      };
+    }
+  }
+
+  if (!response.ok) {
+    if (alreadyExists) {
+      try {
+        await env.OAUTH_KV.delete(credentialKvKey(slot));
+      } catch {
+        // Best effort cleanup; the original error is reported below.
+      }
+    }
+    return {
+      result: "error",
+      status: 502,
+      message: `Google credentials request failed (HTTP ${response.status}).`
+    };
+  }
+
+  try {
+    await env.OAUTH_KV.put(
+      credentialKvKey(slot),
+      JSON.stringify({ id, savedAt: new Date().toISOString() })
+    );
+  } catch {
+    return {
+      result: "error",
+      status: 500,
+      message: "Failed to save credential configuration."
+    };
+  }
+
+  return { result: "ok", status: 200, message: "Credential saved." };
+}
+
+async function deleteAdminCredential(
+  env: Env,
+  slot: CredentialSlot
+): Promise<AdminActionResult> {
+  const id = ADMIN_CREDENTIAL_IDS[slot];
+  const deletion = await deleteGoogleCredential(env, id);
+
+  if (deletion.networkError) {
+    return {
+      result: "error",
+      status: 502,
+      message: "Google credentials request failed or timed out."
+    };
+  }
+  if (!deletion.ok && !deletion.notFound) {
+    return {
+      result: "error",
+      status: 502,
+      message: `Google credentials delete failed (HTTP ${deletion.status}).`
+    };
+  }
+
+  try {
+    await env.OAUTH_KV.delete(credentialKvKey(slot));
+  } catch {
+    return {
+      result: "error",
+      status: 500,
+      message: "Failed to update credential configuration."
+    };
+  }
+
+  return { result: "ok", status: 200, message: "Credential deleted." };
+}
+
+async function setAdminRepositories(
+  env: Env,
+  raw: string
+): Promise<AdminActionResult> {
+  if (typeof env.ALLOWED_REPOSITORIES === "string") {
+    return {
+      result: "rejected",
+      status: 400,
+      message: "Allowed repositories are set by an environment variable."
+    };
+  }
+
+  const parsed = parseAdminRepositories(raw);
+  if (!parsed.ok) {
+    return { result: "rejected", status: 400, message: "Invalid repository list." };
+  }
+
+  try {
+    await env.OAUTH_KV.put(
+      ALLOWED_REPOSITORIES_KV_KEY,
+      JSON.stringify(parsed.repositories)
+    );
+  } catch {
+    return {
+      result: "error",
+      status: 500,
+      message: "Failed to save allowed repositories."
+    };
+  }
+
+  return {
+    result: "ok",
+    status: 200,
+    message:
+      parsed.repositories.length > 0
+        ? "Allowed repositories updated."
+        : "Allowed repositories cleared; no repository is allowed."
+  };
+}
+
+function logAdminAction(
+  action: "save" | "delete" | "repos" | "status",
+  slot: CredentialSlot | "-",
+  result: "ok" | "rejected" | "error",
+  status: number
+): void {
+  console.log(
+    `admin_credentials action=${action} slot=${slot}  result=${result} status=${status}`
+  );
+}
+
+async function renderAdminCredentialsPage(
+  env: Env,
+  config: OwnerPassphraseConfig,
+  message?: string,
+  status = 200,
+  showStatus = false
+): Promise<Response> {
+  const csrfSecret = env.CONSENT_CSRF_SECRET;
+  if (!csrfSecret) {
+    return adminMessageResponse("Server configuration error.", 500);
+  }
+
+  let readRecord: StoredCredentialRecord | null = null;
+  let writeRecord: StoredCredentialRecord | null = null;
+  let allowedRepositories: string[] = [];
+  let repositoriesFromEnv = false;
+  if (showStatus) {
+    [readRecord, writeRecord, allowedRepositories] = await Promise.all([
+      readStoredCredential(env, "read"),
+      readStoredCredential(env, "write"),
+      getAllowedRepositories(env)
+    ]);
+    repositoriesFromEnv = typeof env.ALLOWED_REPOSITORIES === "string";
+  }
+  const csrfToken = await createConsentCsrfToken(
+    ADMIN_CSRF_CLIENT_ID,
+    ADMIN_CSRF_REDIRECT_URI,
+    config.ownerId,
+    "",
+    csrfSecret
+  );
+
+  const credentialStatus = (slot: CredentialSlot, record: StoredCredentialRecord | null) => {
+    const date = adminSavedDate(record?.savedAt);
+    if (!record) return `${slot}: not configured`;
+    return date ? `${slot}: configured (${date})` : `${slot}: configured`;
+  };
+
+  const repositoriesHtml = repositoriesFromEnv
+    ? "<p>Allowed repositories are set by an environment variable.</p>"
+    : allowedRepositories.length > 0
+      ? `<ul>${allowedRepositories
+          .map((repository) => `<li>${escapeHtml(repository)}</li>`)
+          .join("")}</ul>`
+      : "<p>No repositories allowed.</p>";
+
+  const statusHtml = showStatus
+    ? `<h2>Status</h2>
+    <ul>
+      <li>${escapeHtml(credentialStatus("read", readRecord))}</li>
+      <li>${escapeHtml(credentialStatus("write", writeRecord))}</li>
+    </ul>
+    <h2>Allowed repositories</h2>
+    ${repositoriesHtml}`
+    : "";
+
+  const safeMessage = message ? `<p class="result">${escapeHtml(message)}</p>` : "";
+  const safeCsrfToken = escapeHtml(csrfToken);
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Admin credentials</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #f4f4f9; padding: 2rem; }
+    main { max-width: 720px; margin: 0 auto; background: white; padding: 2rem; border-radius: 8px; }
+    form { border-top: 1px solid #ddd; padding-top: 1rem; margin-top: 1rem; }
+    label { display: block; margin-top: 0.5rem; }
+    input[type="password"], input[type="text"], select, textarea { width: 100%; box-sizing: border-box; }
+    textarea { min-height: 6rem; font-family: monospace; }
+    button { margin-top: 0.75rem; padding: 0.5rem 1rem; }
+    .result { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Admin credentials</h1>
+    ${safeMessage}
+    ${statusHtml}
+
+    <form method="POST" action="${ADMIN_CREDENTIALS_PATH}" autocomplete="off">
+      <h2>Show status</h2>
+      <input type="hidden" name="csrf_token" value="${safeCsrfToken}">
+      <label for="status_passphrase">Owner passphrase</label>
+      <input type="password" id="status_passphrase" name="owner_passphrase" autocomplete="off" required>
+      <button type="submit" name="action" value="status">Show status</button>
+    </form>
+
+    <form method="POST" action="${ADMIN_CREDENTIALS_PATH}" autocomplete="off">
+      <h2>Save credential</h2>
+      <input type="hidden" name="csrf_token" value="${safeCsrfToken}">
+      <label for="save_slot">Slot</label>
+      <select id="save_slot" name="slot">
+        <option value="read">read</option>
+        <option value="write">write</option>
+      </select>
+      <label for="save_token">GitHub token</label>
+      <input type="password" id="save_token" name="token" autocomplete="off" required>
+      <label><input type="checkbox" name="replace" value="1"> replace if exists</label>
+      <label for="save_passphrase">Owner passphrase</label>
+      <input type="password" id="save_passphrase" name="owner_passphrase" autocomplete="off" required>
+      <button type="submit" name="action" value="save">Save credential</button>
+    </form>
+
+    <form method="POST" action="${ADMIN_CREDENTIALS_PATH}" autocomplete="off">
+      <h2>Delete credential</h2>
+      <input type="hidden" name="csrf_token" value="${safeCsrfToken}">
+      <label for="delete_slot">Slot</label>
+      <select id="delete_slot" name="slot">
+        <option value="read">read</option>
+        <option value="write">write</option>
+      </select>
+      <label for="delete_passphrase">Owner passphrase</label>
+      <input type="password" id="delete_passphrase" name="owner_passphrase" autocomplete="off" required>
+      <button type="submit" name="action" value="delete">Delete credential</button>
+    </form>
+
+    <form method="POST" action="${ADMIN_CREDENTIALS_PATH}" autocomplete="off">
+      <h2>Set allowed repositories</h2>
+      <input type="hidden" name="csrf_token" value="${safeCsrfToken}">
+      <label for="repositories">Allowed repositories (one per line)</label>
+      <textarea id="repositories" name="repositories" autocomplete="off"></textarea>
+      <label for="repos_passphrase">Owner passphrase</label>
+      <input type="password" id="repos_passphrase" name="owner_passphrase" autocomplete="off" required>
+      <button type="submit" name="action" value="repos">Set allowed repositories</button>
+    </form>
+  </main>
+</body>
+</html>`;
+
+  return adminResponse(html, status);
+}
+
+async function handleAdminCredentialsRequest(request: Request, env: Env): Promise<Response> {
+  const method = request.method.toUpperCase();
+  const passphraseConfig = getOwnerPassphraseConfig(env);
+  const config =
+    !request.headers.has("Cf-Access-Jwt-Assertion") && !env.AUTH_SECRET
+      ? passphraseConfig
+      : null;
+
+  if (!config) {
+    if (method === "GET" || method === "POST") {
+      return adminMessageResponse("Not Found", 404);
+    }
+    return adminMessageResponse("Method Not Allowed", 405);
+  }
+
+  if (method === "GET") {
+    return renderAdminCredentialsPage(env, config);
+  }
+  if (method !== "POST") {
+    return adminMessageResponse("Method Not Allowed", 405);
+  }
+
+  const contentType = request.headers.get("Content-Type") || "";
+  const normalizedContentType = contentType.toLowerCase();
+  if (
+    !normalizedContentType.startsWith("application/x-www-form-urlencoded") &&
+    !normalizedContentType.startsWith("multipart/form-data")
+  ) {
+    return adminMessageResponse("Unsupported Media Type", 415);
+  }
+
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength !== null) {
+    const parsedLength = Number(contentLength);
+    if (Number.isFinite(parsedLength) && parsedLength > ADMIN_MAX_BODY_BYTES) {
+      return adminMessageResponse("Payload Too Large", 413);
+    }
+  }
+
+  let bodyBuffer: ArrayBuffer;
+  try {
+    bodyBuffer = await request.arrayBuffer();
+  } catch {
+    return adminMessageResponse("Invalid request", 400);
+  }
+  if (bodyBuffer.byteLength > ADMIN_MAX_BODY_BYTES) {
+    return adminMessageResponse("Payload Too Large", 413);
+  }
+
+  // Record the attempt before verifying anything, sharing the consent throttle.
+  const throttle = await recordPassphraseFailure(env);
+  if (throttle.failures > PASSPHRASE_MAX_FAILURES) {
+    return adminMessageResponse("Too many failed attempts. Try again later.", 429);
+  }
+
+  let form: FormData;
+  try {
+    form = await new Response(bodyBuffer, {
+      headers: { "Content-Type": contentType }
+    }).formData();
+  } catch (e) {
+    return adminMessageResponse("Invalid request", 400);
+  }
+
+  const csrfSecret = env.CONSENT_CSRF_SECRET;
+  const csrfToken = adminField(form, "csrf_token");
+  const csrfValid = csrfSecret
+    ? await verifyAndConsumeConsentCsrfToken(
+        csrfToken,
+        ADMIN_CSRF_CLIENT_ID,
+        ADMIN_CSRF_REDIRECT_URI,
+        config.ownerId,
+        "",
+        csrfSecret,
+        env
+      )
+    : false;
+  if (!csrfValid) {
+    return adminMessageResponse("Invalid request", 400);
+  }
+
+  const submittedPassphrase = adminField(form, "owner_passphrase", "passphrase");
+  const passphraseValid = await verifyOwnerPassphrase(
+    submittedPassphrase || null,
+    config.passphrase
+  );
+  if (!passphraseValid) {
+    return adminMessageResponse("Invalid request", 400);
+  }
+
+  await resetPassphraseThrottle(env);
+
+  const action = normalizeAdminAction(
+    adminField(form, "action", "credential_action")
+  );
+  let slot: CredentialSlot | undefined;
+  if (action === "save" || action === "delete") {
+    const slotValue = adminField(form, "slot", "credential_slot").trim().toLowerCase();
+    if (slotValue !== "read" && slotValue !== "write") {
+      return adminMessageResponse("Invalid request", 400);
+    }
+    slot = slotValue;
+  } else if (action !== "repos" && action !== "status") {
+    return adminMessageResponse("Invalid request", 400);
+  }
+
+  let actionResult: AdminActionResult;
+  let submittedToken = "";
+  if (action === "save" && slot) {
+    submittedToken = adminField(
+      form,
+      "token",
+      "github_token",
+      "credential_token"
+    );
+    const replaceExisting =
+      form.get("replace") !== null || form.get("replace_if_exists") !== null;
+    actionResult = await saveAdminCredential(env, slot, submittedToken, replaceExisting);
+    logAdminAction("save", slot, actionResult.result, actionResult.status);
+  } else if (action === "delete" && slot) {
+    actionResult = await deleteAdminCredential(env, slot);
+    logAdminAction("delete", slot, actionResult.result, actionResult.status);
+  } else if (action === "status") {
+    actionResult = { result: "ok", status: 200, message: "Status." };
+    logAdminAction("status", "-", actionResult.result, actionResult.status);
+  } else {
+    const repositories = adminField(
+      form,
+      "repositories",
+      "allowed_repositories",
+      "repos"
+    );
+    actionResult = await setAdminRepositories(env, repositories);
+    logAdminAction("repos", "-", actionResult.result, actionResult.status);
+  }
+
+  return renderAdminCredentialsPage(
+    env,
+    config,
+    sanitizeSecret(sanitizeSecret(actionResult.message, env.GEMINI_API_KEY), submittedToken),
+    actionResult.status,
+    true
+  );
+}
+
 // Initialize OAuth 2.1 Provider
 // Note: @cloudflare/workers-oauth-provider 0.1.0 requires an apiRoute / apiHandler pair.
 // We configure apiRoute to /oauth/dummy-api so it satisfies provider initialization
@@ -3115,6 +3851,10 @@ export default {
     const hostValidation = validateHostAndOrigin(request, env);
     if (!hostValidation.valid) {
       return new Response(hostValidation.error || "Forbidden", { status: 403 });
+    }
+
+    if (url.pathname === ADMIN_CREDENTIALS_PATH) {
+      return handleAdminCredentialsRequest(request, env);
     }
 
     // RFC 9728 Protected Resource Metadata Discovery endpoints

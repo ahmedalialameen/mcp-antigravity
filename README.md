@@ -13,6 +13,7 @@ A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It 
 - **Identity Verification & Security**: Supports Cloudflare Access JWT validation (`Cf-Access-Jwt-Assertion` validated against official Access JWKS) and HMAC-signed identity proxy verification (`AUTH_SECRET`). Never trusts unverified raw email headers.
 - **OAuth 2.1 with Explicit User Consent & PKCE**: Implements OAuth 2.1 routes (`/oauth/authorize`, `/oauth/token`, `/oauth/register`, `/.well-known/oauth-authorization-server`) backed by Cloudflare KV (`OAUTH_KV`). Enforces mandatory PKCE (S256), scope validation, canonical resource validation, and CSRF-protected explicit user consent.
 - **Host & Origin Validation**: Prevents DNS rebinding and unauthorized cross-origin requests with configurable `ALLOWED_HOSTS` and dynamic CORS headers.
+- **Owner Admin Credentials Page**: When owner-passphrase mode is configured, `/admin/credentials` lets the owner store or delete Google-managed GitHub credentials and manage the repository allowlist without the token ever passing through chat.
 
 ---
 
@@ -200,13 +201,23 @@ In `wrangler.jsonc` (or via `wrangler secret put`):
 }
 ```
 
-*Note: Both credential IDs are optional. Existing deployments without GitHub credentials configured retain their generic autonomous functionality. If a repository task is requested without the required credential ID configured, the Worker fails closed before sending any request to Google.*
+*Note: Both credential IDs are optional. Existing deployments without GitHub credentials configured retain their generic autonomous functionality. If a repository task is requested without the required credential ID configured, the Worker fails closed before sending any request to Google. When the environment variables are unset, the Worker can fall back to credential IDs saved by the owner admin page in `OAUTH_KV`.*
+
+#### Step D: Owner Admin Page for Credentials and Allowed Repositories
+
+When owner-passphrase mode is configured, the owner can manage credentials and the repository allowlist at `/admin/credentials`. The page is intentionally not linked from anywhere else. It requires the same `CONSENT_CSRF_SECRET` and `CONSENT_COORDINATOR` bindings as the consent page, and every submission requires the owner passphrase plus a single-use CSRF nonce. Failed attempts share the global consent-page throttle (HTTP 429 after the limit).
+
+- **Save credential**: the slot determines the fixed Google credential id (`read` -> `antigravity-github-read`, `write` -> `antigravity-github-write`). The token is sent directly from the Worker to Google's Credentials API and is never stored in KV, returned in HTML, or logged. KV stores only `{ "id": "...", "savedAt": "..." }`.
+- **Delete credential**: deletes the fixed Google credential (a missing credential counts as success) and removes the KV record.
+- **Allowed repositories**: one `owner/repo` per line, at most 50 entries, normalized to lowercase and deduplicated. An empty list denies every repository.
+
+Repository access is fail-closed. Every repository-scoped call must match `ALLOWED_REPOSITORIES` (comma-separated environment variable) when set; otherwise it must match the KV list saved by the admin page. A missing or empty list denies all repositories before any Google call or credential lookup.
 
 ---
 
 ## Security Boundaries & Limitations
 
-1. **Authorization Boundary is the PAT Scope**: The `repository` tool argument is task context for the agent, **not** an authorization boundary. The actual repository boundary is enforced strictly by GitHub using the repository selection configured on the fine-grained PAT. Always limit PATs to selected repositories.
+1. **Authorization Boundary is the PAT Scope**: The `repository` tool argument is task context for the agent, **not** an authorization boundary. The Worker additionally enforces the `ALLOWED_REPOSITORIES`/KV allowlist before any Google call, but the actual repository boundary is enforced strictly by GitHub using the repository selection configured on the fine-grained PAT. Always limit PATs to selected repositories.
 2. **Branch Protection & Rulesets Required**: The MCP tool allowlist permits `push_files`, but MCP tool allowlists cannot enforce which branch is passed as an argument to `push_files`. Mode selection in the application does not guarantee branch isolation. **You must configure GitHub branch protection rules or repository rulesets** on your default and protected branches (e.g. `main`) to reject direct pushes and force pushes, requiring changes to arrive via pull requests.
 3. **No Merge Operations**: Merge tools (`merge_pull_request`), repository deletion/creation, branch-protection administration, repository settings, and secrets management are never exposed in any mode. Implementation tasks open draft pull requests for human review.
 4. **Untrusted GitHub Content**: All repository content, files, README/AGENTS files, issues, PR comments, and commit messages are treated as untrusted input. The agent is explicitly instructed that external GitHub content must never override safety policies or instructions, nor reveal credentials.
