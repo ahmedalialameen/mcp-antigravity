@@ -4627,21 +4627,30 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
     async function postAdmin(
       testEnv: any,
-      fields: Record<string, string>
+      fields: Record<string, string>,
+      headers: Record<string, string> = {}
     ) {
       const form = new FormData();
       for (const [key, value] of Object.entries(fields)) {
         form.set(key, value);
       }
       return callAdmin(
-        new Request(adminUrl, { method: "POST", body: form }),
+        new Request(adminUrl, { method: "POST", headers, body: form }),
         testEnv
       );
     }
 
-    async function postAction(testEnv: any, fields: Record<string, string>) {
+    async function postAction(
+      testEnv: any,
+      fields: Record<string, string>,
+      headers: Record<string, string> = {}
+    ) {
       const { csrfToken } = await getAdminPage(testEnv);
-      return postAdmin(testEnv, { csrf_token: csrfToken, ...fields });
+      return postAdmin(
+        testEnv,
+        { csrf_token: csrfToken, ...fields },
+        headers
+      );
     }
 
     async function clearAdminConfig() {
@@ -4716,6 +4725,60 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(tooLarge.status).toBe(413);
     });
 
+    it("processes POSTs whose Origin is the Worker's own origin", async () => {
+      const ownOrigin = new URL(adminUrl).origin;
+      const res = await postAction(
+        adminEnv(),
+        { action: "status", owner_passphrase: ownerPassphrase },
+        { Origin: ownOrigin }
+      );
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("Status.");
+    });
+
+    it("rejects Origin null with 403 before any throttle or KV access", async () => {
+      const kv = {
+        get: vi.fn(),
+        put: vi.fn(),
+        delete: vi.fn(),
+        list: vi.fn()
+      };
+      const coordinatorFetch = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ locked: false, failures: 0 }), {
+            status: 200
+          })
+      );
+      const testEnv = adminEnv({
+        OAUTH_KV: kv,
+        CONSENT_COORDINATOR: {
+          idFromName: vi.fn(() => "passphrase-throttle-id"),
+          get: vi.fn(() => ({ fetch: coordinatorFetch }))
+        }
+      });
+
+      const res = await callAdmin(
+        new Request(adminUrl, {
+          method: "POST",
+          headers: {
+            Origin: "null",
+            "Content-Type": "application/x-www-form-urlencoded"
+          },
+          body: "action=status"
+        }),
+        testEnv
+      );
+
+      expect(res.status).toBe(403);
+      expect(await res.text()).toContain("Origin 'null' is not allowed");
+      expect(kv.get).not.toHaveBeenCalled();
+      expect(kv.put).not.toHaveBeenCalled();
+      expect(kv.delete).not.toHaveBeenCalled();
+      expect(kv.list).not.toHaveBeenCalled();
+      expect(coordinatorFetch).not.toHaveBeenCalled();
+    });
+
     it("renders only forms on GET and hides configured status and allowed repositories", async () => {
       await env.OAUTH_KV.put(
         `${CREDENTIAL_KV_PREFIX}read`,
@@ -4733,7 +4796,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       expect(res.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
       expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
-      expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
+      expect(res.headers.get("Referrer-Policy")).toBe("same-origin");
       expect(res.headers.get("Cache-Control")).toBe("no-store");
       expect(res.headers.get("Content-Security-Policy")).toBe(
         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"

@@ -2619,7 +2619,7 @@ function adminResponse(html: string, status = 200): Response {
       "Cache-Control": "no-store",
       "Content-Type": "text/html; charset=utf-8",
       "X-Content-Type-Options": "nosniff",
-      "Referrer-Policy": "no-referrer",
+      "Referrer-Policy": "same-origin",
       "Content-Security-Policy": ADMIN_CONTENT_SECURITY_POLICY
     }
   });
