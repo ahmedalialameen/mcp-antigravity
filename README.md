@@ -5,8 +5,8 @@ A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It 
 ## Features
 
 - **Google Antigravity Integration**: Connects to Google's official Interactions API endpoint `https://generativelanguage.googleapis.com/v1beta/interactions` using the supported agent identifier `antigravity-preview-09-2026` and official `x-goog-api-key: <GEMINI_API_KEY>` header.
-- **GitHub Official Remote MCP Integration**: Directly registers GitHub's official remote MCP endpoint (`https://api.githubcopilot.com/mcp/`) within Google Interactions API's `tools` array as an `mcp_server` authenticated via Google-managed credential IDs. No custom GitHub server or proxy required.
-- **Controlled Operational Modes**: Restricts GitHub MCP tools across 4 explicit modes (`inspect`, `review`, `propose`, `implement`) using both Google's `allowed_tools` and GitHub remote headers (`X-MCP-Tools`, `X-MCP-Readonly`, `X-MCP-Exclude-Tools`).
+- **GitHub Sandbox Access**: Repository tasks reach GitHub only with `curl` or `git` inside the Google Antigravity sandbox. The Worker restricts sandbox egress to `api.github.com` and `github.com` using Google-managed credential IDs; authentication is injected automatically by the egress proxy.
+- **Controlled Operational Modes**: Restricts repository access across 4 explicit modes (`inspect`, `review`, `propose`, `implement`) using per-mode credential selection and a mode-specific system instruction. Read modes are GET-only; `implement` may only create a short-lived branch and open a draft pull request.
 - **MCP Server & Async Task Tools**: Implements `run_antigravity_agent`, `start_antigravity_task`, `get_antigravity_task`, `cancel_antigravity_task`, and `list_antigravity_tasks` via official SDK v2 (`@modelcontextprotocol/server`). Tasks run in Google background mode (`background: true`, `store: true`) so long-running work can outlive a single MCP request.
 - **Stateless Web-Standard MCP Transport**: Exposes the primary remote MCP endpoint at `/mcp` via `createMcpHandler()`, providing native support for MCP 2026-07-28 and 2025 stateless fallback over POST without requiring transport session state.
 - **Protected Resource Metadata (RFC 9728)**: Exposes discovery at `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-protected-resource`, and supplies `resource_metadata` in 401 `WWW-Authenticate` response headers.
@@ -122,7 +122,7 @@ To enable repository-scoped software engineering tasks against GitHub repositori
 │  Claude Client │ ──────────────────────────────────────> │   Cloudflare Worker       │
 │ (Desktop/Code) │ <────────────────────────────────────── │ - Validates schema & mode │
 └────────────────┘   OAuth 2.1 PKCE Authorization          │ - Selects Credential ID   │
-                                                           │ - Builds tool allowlists  │
+                                                           │ - Builds allowlist        │
                                                            └─────────────┬─────────────┘
                                                                          │ POST /interactions
                                                                          │ x-goog-api-key
@@ -131,16 +131,17 @@ To enable repository-scoped software engineering tasks against GitHub repositori
                                                            │ Google Antigravity Agent  │
                                                            │ (Linux Sandbox runtime)   │
                                                            └─────────────┬─────────────┘
+                                                                         │ curl / git
                                                                          │ Managed Egress Proxy
                                                                          │ (Injects GitHub PAT)
                                                                          ▼
                                                            ┌───────────────────────────┐
-                                                           │ GitHub Remote MCP Server  │
-                                                           │ api.githubcopilot.com/mcp │
+                                                           │ api.github.com            │
+                                                           │ github.com                │
                                                            └───────────────────────────┘
 ```
 
-The Worker stores **only the Google-managed credential IDs**, never GitHub Personal Access Tokens (PATs) or secrets. Tokens are resolved and injected securely by Google's managed agent egress proxy directly on outbound requests to `https://api.githubcopilot.com/mcp/`.
+The Worker stores **only the Google-managed credential IDs**, never GitHub Personal Access Tokens (PATs) or secrets. Tokens are resolved and injected securely by Google's managed agent egress proxy directly on outbound requests to `https://api.github.com` and `https://github.com`; the agent never sees or handles them.
 
 #### Step A: Generate Fine-Grained GitHub PATs
 
@@ -218,8 +219,8 @@ Repository access is fail-closed. Every repository-scoped call must match `ALLOW
 ## Security Boundaries & Limitations
 
 1. **Authorization Boundary is the PAT Scope**: The `repository` tool argument is task context for the agent, **not** an authorization boundary. The Worker additionally enforces the `ALLOWED_REPOSITORIES`/KV allowlist before any Google call, but the actual repository boundary is enforced strictly by GitHub using the repository selection configured on the fine-grained PAT. Always limit PATs to selected repositories.
-2. **Branch Protection & Rulesets Required**: The MCP tool allowlist permits `push_files`, but MCP tool allowlists cannot enforce which branch is passed as an argument to `push_files`. Mode selection in the application does not guarantee branch isolation. **You must configure GitHub branch protection rules or repository rulesets** on your default and protected branches (e.g. `main`) to reject direct pushes and force pushes, requiring changes to arrive via pull requests.
-3. **No Merge Operations**: Merge tools (`merge_pull_request`), repository deletion/creation, branch-protection administration, repository settings, and secrets management are never exposed in any mode. Implementation tasks open draft pull requests for human review.
+2. **Branch Protection & Rulesets Required**: The agent is instructed to work only on a new `antigravity/<short-slug>` branch, but the Worker cannot inspect the `curl`/`git` commands executed inside the sandbox. Mode selection and system instructions do not guarantee branch isolation. **You must configure GitHub branch protection rules or repository rulesets** on your default and protected branches (e.g. `main`) to reject direct pushes and force pushes, requiring changes to arrive via pull requests.
+3. **No Merge or Destructive Operations**: The system instruction forbids merge endpoints, writes to the default branch or its ref, branch/repository deletion, force-updating refs, and force-pushing. Implementation tasks open draft pull requests for human review. The fine-grained PAT should not grant repository administration, settings, or secrets permissions.
 4. **Untrusted GitHub Content**: All repository content, files, README/AGENTS files, issues, PR comments, and commit messages are treated as untrusted input. The agent is explicitly instructed that external GitHub content must never override safety policies or instructions, nor reveal credentials.
 
 ---
@@ -239,24 +240,6 @@ Run the test suite using Vitest:
 ```bash
 npm test
 ```
-
-#### Running Optional Gated Live Integration Tests
-
-The test suite includes gated live integration tests that test the live pathway (`Client HTTP Request -> Cloudflare Worker (/mcp) -> Bearer token validation -> MCP tools/call -> Google Interactions API -> Antigravity -> GitHub remote MCP -> GitHub`). These tests are disabled by default.
-
-To run the live GitHub MCP integration test against an external environment:
-
-```bash
-RUN_LIVE_GITHUB_MCP_TESTS=true \
-GEMINI_API_KEY="your-gemini-api-key" \
-GITHUB_MCP_READ_CREDENTIAL_ID="your-read-credential-id" \
-LIVE_TEST_GITHUB_REPO="your-org/your-private-test-repo" \
-LIVE_TEST_EXPECTED_SNIPPET="expected file snippet" \
-LIVE_TEST_GITHUB_PR=1 \
-npm test
-```
-
-*Note on test execution & authorization scope: The live integration test exercises the Cloudflare Worker `/mcp` entry-point handler, JSON-RPC dispatch, and Bearer token validation using a valid synthetic access token provisioned directly into the test environment's `OAUTH_KV`. It does not test the interactive browser OAuth PKCE authorization or user consent screen flow. Furthermore, using a dedicated private test repository with a known file snippet is mandatory to verify fine-grained GitHub PAT repository authorization boundaries.*
 
 ### TypeScript Validation
 
@@ -372,29 +355,28 @@ Calls `POST /interactions/<id>/cancel`. Cancelling an already-finished task retu
 
 Lists indexed tasks newest first with `taskId`, `status`, `createdAt`, `mode`, and `taskPreview` per item, using KV list metadata and following KV cursors up to 1,000 scanned keys.
 
-### Operating Modes & GitHub Tool Restrictions
+### Operating Modes & GitHub Access
 
-| Mode | Access Level | Credential Used | Exposed GitHub Tools | Headers Sent to GitHub MCP |
-| :--- | :--- | :--- | :--- | :--- |
-| `inspect` | Read-only | `GITHUB_MCP_READ_CREDENTIAL_ID` | `get_file_contents`, `search_code`, `pull_request_read`, `search_pull_requests` | `X-MCP-Tools: get_file_contents,search_code,pull_request_read,search_pull_requests`<br>`X-MCP-Readonly: true` |
-| `review` | Read-only | `GITHUB_MCP_READ_CREDENTIAL_ID` | `get_file_contents`, `search_code`, `pull_request_read`, `search_pull_requests` | `X-MCP-Tools: get_file_contents,search_code,pull_request_read,search_pull_requests`<br>`X-MCP-Readonly: true` |
-| `propose` | Read-only (suggest patches) | `GITHUB_MCP_READ_CREDENTIAL_ID` | `get_file_contents`, `search_code`, `pull_request_read`, `search_pull_requests` | `X-MCP-Tools: get_file_contents,search_code,pull_request_read,search_pull_requests`<br>`X-MCP-Readonly: true` |
-| `implement` | Controlled write | `GITHUB_MCP_WRITE_CREDENTIAL_ID` | Read tools + `create_branch`, `push_files`, `create_pull_request` | `X-MCP-Tools: get_file_contents,search_code,pull_request_read,search_pull_requests,create_branch,push_files,create_pull_request`<br>`X-MCP-Exclude-Tools: merge_pull_request` |
+| Mode | Access Level | Credential Used | GitHub Access |
+| :--- | :--- | :--- | :--- |
+| `inspect` | Read-only | `GITHUB_MCP_READ_CREDENTIAL_ID` | GET requests only against `api.github.com` / `github.com` |
+| `review` | Read-only | `GITHUB_MCP_READ_CREDENTIAL_ID` | GET requests only against `api.github.com` / `github.com` |
+| `propose` | Read-only (suggest patches) | `GITHUB_MCP_READ_CREDENTIAL_ID` | GET requests only against `api.github.com` / `github.com` |
+| `implement` | Controlled write | `GITHUB_MCP_WRITE_CREDENTIAL_ID` | Commit on a new `antigravity/<short-slug>` branch and open a draft pull request |
 
-**Native Capabilities Preserved**: In all modes, native agent tools (`code_execution`, `google_search`, `url_context`) and inline files (`contextFiles` under `environment.sources`) remain active. Stateful tool calling is maintained with `"store": true`.
+**Native Capabilities Preserved**: In all repository modes, native agent tools (`code_execution`, `google_search`, `url_context`) and inline files (`contextFiles` under `environment.sources`) remain active. The sandbox egress allowlist contains exactly `api.github.com` and `github.com`, with authentication injected automatically by the proxy. Stateful tool calling is maintained with `"store": true`.
 
 **Implementation Task Workflow**:
 When `mode: "implement"` is specified, Antigravity follows a strictly defined lifecycle:
 1. Determines the base branch from `baseBranch` or uses the repository default branch if omitted.
-2. Creates a dedicated feature branch named `antigravity/<descriptive-task-name>`.
-3. Makes changes strictly on that feature branch.
-4. `push_files` must target that feature branch. Never pushes directly to the base branch.
-5. `create_pull_request` must be invoked with `draft: true`, using that feature branch as `head` and the specified `baseBranch` (or default branch) as `base`.
-6. Runs relevant tests and reports their actual results.
-7. Returns branch name, commit SHA, draft PR URL, and test results.
-8. Safety restrictions: Never calls `merge_pull_request`. Never force-pushes.
+2. Creates a new branch named `antigravity/<short-slug>` from the base branch.
+3. Commits all implementation changes only on that branch.
+4. Opens a **draft** pull request from that branch into the base branch.
+5. Runs relevant tests and reports their actual results.
+6. Returns branch name, commit SHA, draft PR URL, and test results.
+7. Safety restrictions: Never writes to the default branch or its ref. Never calls a merge endpoint. Never deletes branches or repositories. Never force-updates refs. Never force-pushes.
 
-*Note on authorization boundary: Because Google Antigravity invokes GitHub remote MCP tools directly without the Cloudflare Worker intercepting individual MCP tool arguments, the Worker cannot programmatically enforce the target branch string in `push_files`. GitHub branch protection rules or repository rulesets remain the mandatory authorization boundary preventing direct writes to default and protected branches.*
+*Note on authorization boundary: Because Google Antigravity executes `curl`/`git` commands inside its sandbox without the Cloudflare Worker intercepting individual commands, the Worker cannot programmatically enforce the target branch. GitHub branch protection rules or repository rulesets remain the mandatory authorization boundary preventing direct writes to default and protected branches.*
 
 **Output:**
 
