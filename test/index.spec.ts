@@ -3529,7 +3529,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(mcpText).not.toContain("isError\":true");
     });
 
-    it("2. 'inspect', 'review', and 'propose' attach the read credential and read-only GitHub tool configuration", async () => {
+    it("2. 'inspect', 'review', and 'propose' attach the read network credential and read-only GitHub tool configuration", async () => {
       const modes = ["inspect", "review", "propose"] as const;
 
       for (const mode of modes) {
@@ -3555,7 +3555,18 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         const githubTool = sentPayload.tools.find((t: any) => t.type === "mcp_server" && t.name === "github");
         expect(githubTool).toBeDefined();
         expect(githubTool.url).toBe(GITHUB_MCP_REMOTE_URL);
-        expect(githubTool.credential).toBe("cred-github-read-123");
+        expect(githubTool.credential).toBeUndefined();
+        expect(sentPayload.environment).toEqual({
+          type: "remote",
+          network: {
+            allowlist: [
+              {
+                domain: "api.githubcopilot.com",
+                credential: "cred-github-read-123"
+              }
+            ]
+          }
+        });
         expect(githubTool.headers["X-MCP-Tools"]).toBe(
           "get_file_contents,search_code,pull_request_read,search_pull_requests"
         );
@@ -3597,7 +3608,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       }
     });
 
-    it("4. 'implement' attaches the write credential and exposes only the approved write tools in addition to the required read tools", async () => {
+    it("4. 'implement' attaches the write network credential and exposes only the approved write tools in addition to the required read tools", async () => {
       let sentPayload: any = null;
       vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (_url, init) => {
         sentPayload = JSON.parse(init?.body as string);
@@ -3623,7 +3634,18 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       const githubTool = sentPayload.tools.find((t: any) => t.type === "mcp_server" && t.name === "github");
       expect(githubTool).toBeDefined();
-      expect(githubTool.credential).toBe("cred-github-write-456");
+      expect(githubTool.credential).toBeUndefined();
+      expect(sentPayload.environment).toEqual({
+        type: "remote",
+        network: {
+          allowlist: [
+            {
+              domain: "api.githubcopilot.com",
+              credential: "cred-github-write-456"
+            }
+          ]
+        }
+      });
 
       // Verify exact approved tools (4 read + 3 write)
       const expectedTools = [
@@ -3823,7 +3845,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       // store: true explicitly set
       expect(sentPayload.store).toBe(true);
 
-      // environment.sources preserved
+      // environment.sources preserved alongside the network allowlist
       expect(sentPayload.environment).toEqual({
         type: "remote",
         sources: [
@@ -3832,7 +3854,15 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
             target: "/workspace/spec.txt",
             content: "Requirement details"
           }
-        ]
+        ],
+        network: {
+          allowlist: [
+            {
+              domain: "api.githubcopilot.com",
+              credential: "cred-github-write-456"
+            }
+          ]
+        }
       });
 
       // System instruction includes untrusted content handling and implementation steps
@@ -5317,7 +5347,10 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
       let payload = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
       let githubTool = payload.tools.find((tool: any) => tool.type === "mcp_server");
-      expect(githubTool.credential).toBe("env-read");
+      expect(githubTool.credential).toBeUndefined();
+      expect(payload.environment.network.allowlist).toEqual([
+        { domain: "api.githubcopilot.com", credential: "env-read" }
+      ]);
 
       await createInteraction(
         "google-key",
@@ -5329,7 +5362,10 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
       payload = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string);
       githubTool = payload.tools.find((tool: any) => tool.type === "mcp_server");
-      expect(githubTool.credential).toBe("env-write");
+      expect(githubTool.credential).toBeUndefined();
+      expect(payload.environment.network.allowlist).toEqual([
+        { domain: "api.githubcopilot.com", credential: "env-write" }
+      ]);
 
       const kvOnlyEnv = adminEnv({
         GITHUB_MCP_READ_CREDENTIAL_ID: undefined,
@@ -5346,7 +5382,10 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
       payload = JSON.parse(fetchSpy.mock.calls[2][1]?.body as string);
       githubTool = payload.tools.find((tool: any) => tool.type === "mcp_server");
-      expect(githubTool.credential).toBe("kv-read");
+      expect(githubTool.credential).toBeUndefined();
+      expect(payload.environment.network.allowlist).toEqual([
+        { domain: "api.githubcopilot.com", credential: "kv-read" }
+      ]);
 
       const noCredentialEnv = adminEnv({
         GITHUB_MCP_READ_CREDENTIAL_ID: undefined,
