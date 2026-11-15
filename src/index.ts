@@ -357,6 +357,7 @@ export interface InteractionRequestOptions {
 export interface FormatTaskResultOptions {
   offset?: number;
   includeRaw?: boolean;
+  includeSteps?: boolean;
   apiKey?: string;
 }
 
@@ -802,6 +803,120 @@ function sanitizeDeep(value: any, apiKey?: string): any {
   return value;
 }
 
+function stripThoughtsAndSignatures(value: any): any {
+  if (Array.isArray(value)) {
+    return value
+      .filter(
+        (item) =>
+          !(
+            item &&
+            typeof item === "object" &&
+            !Array.isArray(item) &&
+            item.type === "thought"
+          )
+      )
+      .map((item) => stripThoughtsAndSignatures(item));
+  }
+  if (value && typeof value === "object") {
+    const result: Record<string, any> = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (key === "signature") continue;
+      result[key] = stripThoughtsAndSignatures(item);
+    }
+    return result;
+  }
+  return value;
+}
+
+function stepTextParts(step: any): string[] {
+  const content = step?.content;
+  if (typeof content === "string") {
+    return content ? [content] : [];
+  }
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  const parts: string[] = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      parts.push(part);
+    } else if (
+      part &&
+      typeof part === "object" &&
+      part.type === "text" &&
+      typeof part.text === "string"
+    ) {
+      parts.push(part.text);
+    }
+  }
+  return parts;
+}
+
+function deriveOutputTextFromSteps(steps: any): string | undefined {
+  if (!Array.isArray(steps)) return undefined;
+  const modelOutputs = steps.filter(
+    (step) => step && typeof step === "object" && step.type === "model_output"
+  );
+  if (modelOutputs.length === 0) return undefined;
+
+  const lastParts = stepTextParts(modelOutputs[modelOutputs.length - 1]);
+  if (lastParts.length > 0) {
+    return lastParts.join("");
+  }
+
+  const allParts = modelOutputs.flatMap((step) => stepTextParts(step));
+  return allParts.length > 0 ? allParts.join("") : undefined;
+}
+
+const MAX_COMPACT_STEPS = 100;
+const MAX_STEP_ARGS_PREVIEW_CHARS = 300;
+const MAX_STEP_RESULT_PREVIEW_CHARS = 500;
+
+function previewStepValue(value: any, maxChars: number, apiKey?: string): string {
+  if (value === undefined || value === null) return "";
+  let text: string;
+  if (typeof value === "string") {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+  }
+  return truncateCharacters(sanitizeSecret(text ?? "", apiKey), maxChars);
+}
+
+function compactInteractionSteps(steps: any, apiKey?: string): any[] {
+  if (!Array.isArray(steps)) return [];
+  const compact: any[] = [];
+  for (const step of steps) {
+    if (compact.length >= MAX_COMPACT_STEPS) break;
+    if (!step || typeof step !== "object" || step.type === "thought") continue;
+    compact.push({
+      type: typeof step.type === "string" ? step.type : "",
+      name: typeof step.name === "string" ? step.name : "",
+      is_error:
+        step.is_error === true ||
+        step.isError === true ||
+        (step.result !== null &&
+          typeof step.result === "object" &&
+          step.result.isError === true),
+      argsPreview: previewStepValue(
+        step.arguments ?? step.args,
+        MAX_STEP_ARGS_PREVIEW_CHARS,
+        apiKey
+      ),
+      resultPreview: previewStepValue(
+        step.result ?? step.output ?? step.content ?? step.text,
+        MAX_STEP_RESULT_PREVIEW_CHARS,
+        apiKey
+      )
+    });
+  }
+  return compact;
+}
+
 function pageText(
   text: string,
   offset: number
@@ -829,13 +944,16 @@ export function formatTaskResult(
   const apiKey = options?.apiKey;
   const offset = options?.offset ?? 0;
   const includeRaw = options?.includeRaw === true;
-  const sanitizedInteraction = sanitizeDeep(interaction, apiKey);
+  const includeSteps = options?.includeSteps === true;
+  const sanitizedInteraction = stripThoughtsAndSignatures(sanitizeDeep(interaction, apiKey));
   const status = typeof sanitizedInteraction?.status === "string" ? sanitizedInteraction.status : "";
   const taskId = typeof sanitizedInteraction?.id === "string" ? sanitizedInteraction.id : undefined;
   const done = isTerminalInteractionStatus(status);
 
   const outputTextValue =
-    typeof sanitizedInteraction?.output_text === "string" ? sanitizedInteraction.output_text : undefined;
+    typeof sanitizedInteraction?.output_text === "string"
+      ? sanitizedInteraction.output_text
+      : deriveOutputTextFromSteps(sanitizedInteraction?.steps);
   const outputPage = outputTextValue !== undefined ? pageText(outputTextValue, offset) : undefined;
 
   const result: Record<string, any> = {
@@ -882,6 +1000,10 @@ export function formatTaskResult(
   if (includeRaw) {
     const rawText = JSON.stringify(sanitizedInteraction);
     result.raw = pageText(rawText, offset).text;
+  }
+
+  if (includeSteps) {
+    result.steps = compactInteractionSteps(sanitizedInteraction?.steps, apiKey);
   }
 
   return JSON.stringify(result, null, 2);
@@ -1399,10 +1521,14 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
         includeRaw: z
           .boolean()
           .optional()
-          .describe("Include the sanitized raw interaction JSON.")
+          .describe("Include the sanitized raw interaction JSON."),
+        includeSteps: z
+          .boolean()
+          .optional()
+          .describe("Include up to 100 compact execution steps with sanitized previews.")
       })
     },
-    async ({ taskId, waitSeconds, offset, includeRaw }) => {
+    async ({ taskId, waitSeconds, offset, includeRaw, includeSteps }) => {
       try {
         const validTaskId = validateTaskId(taskId);
         let interaction = await getInteraction(env.GEMINI_API_KEY, validTaskId);
@@ -1428,6 +1554,7 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
           formatTaskResult(interaction, {
             offset,
             includeRaw,
+            includeSteps,
             apiKey: env.GEMINI_API_KEY
           })
         );
