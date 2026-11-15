@@ -548,7 +548,12 @@ async function buildInteractionPayload(
       name: "github",
       url: GITHUB_MCP_REMOTE_URL,
       headers: mcpHeaders,
-      allowed_tools: allowedTools
+      allowed_tools: [
+        {
+          mode: "auto",
+          tools: allowedTools
+        }
+      ]
     };
 
     const repoEnvironment: Record<string, any> = {

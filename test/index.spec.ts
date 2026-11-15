@@ -3572,10 +3572,15 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         );
         expect(githubTool.headers["X-MCP-Readonly"]).toBe("true");
         expect(githubTool.allowed_tools).toEqual([
-          "get_file_contents",
-          "search_code",
-          "pull_request_read",
-          "search_pull_requests"
+          {
+            mode: "auto",
+            tools: [
+              "get_file_contents",
+              "search_code",
+              "pull_request_read",
+              "search_pull_requests"
+            ]
+          }
         ]);
       }
     });
@@ -3602,7 +3607,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
         const githubTool = sentPayload.tools.find((t: any) => t.type === "mcp_server");
         for (const writeTool of writeTools) {
-          expect(githubTool.allowed_tools).not.toContain(writeTool);
+          expect(githubTool.allowed_tools[0].tools).not.toContain(writeTool);
           expect(githubTool.headers["X-MCP-Tools"]).not.toContain(writeTool);
         }
       }
@@ -3657,7 +3662,12 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         "push_files",
         "create_pull_request"
       ];
-      expect(githubTool.allowed_tools).toEqual(expectedTools);
+      expect(githubTool.allowed_tools).toEqual([
+        {
+          mode: "auto",
+          tools: expectedTools
+        }
+      ]);
       expect(githubTool.headers["X-MCP-Tools"]).toBe(expectedTools.join(","));
     });
 
@@ -3678,7 +3688,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
 
       const githubTool = sentPayload.tools.find((t: any) => t.type === "mcp_server" && t.name === "github");
-      expect(githubTool.allowed_tools).not.toContain("merge_pull_request");
+      expect(githubTool.allowed_tools[0].tools).not.toContain("merge_pull_request");
       expect(githubTool.headers["X-MCP-Tools"]).not.toContain("merge_pull_request");
       expect(githubTool.headers["X-MCP-Exclude-Tools"]).toBe("merge_pull_request");
     });
