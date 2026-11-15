@@ -42,7 +42,10 @@ import worker, {
   taskRecentIndexKey,
   MAX_OUTPUT_CHARS,
   MAX_TASK_METADATA_BYTES,
-  MAX_TASK_METADATA_PREVIEW_CHARS
+  MAX_TASK_METADATA_PREVIEW_CHARS,
+  ADMIN_CREDENTIALS_PATH,
+  ALLOWED_REPOSITORIES_KV_KEY,
+  CREDENTIAL_KV_PREFIX
 } from "../src/index";
 import {
   env,
@@ -469,7 +472,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       ...env,
       GEMINI_API_KEY: "task-test-api-key-123",
       GITHUB_MCP_READ_CREDENTIAL_ID: "cred-read",
-      GITHUB_MCP_WRITE_CREDENTIAL_ID: "cred-write"
+      GITHUB_MCP_WRITE_CREDENTIAL_ID: "cred-write",
+      ALLOWED_REPOSITORIES: "owner/repo"
     };
 
     async function makeHandler(testEnv: any = taskEnv) {
@@ -1284,8 +1288,9 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       );
 
       expect(parsed.steps.length).toBe(100);
+      expect(parsed.omittedSteps).toBe(20);
       expect(parsed.steps[0].type).toBe("mcp_server_tool_call");
-      expect(parsed.steps[0].name).toBe("tool_0");
+      expect(parsed.steps[0].name).toBe("tool_20");
       expect(parsed.steps[0].is_error).toBe(true);
       expect(parsed.steps[0].argsPreview.length).toBe(300);
       expect(parsed.steps[0].resultPreview.length).toBe(500);
@@ -3466,7 +3471,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       ...env,
       GEMINI_API_KEY: "test-fake-gemini-key",
       GITHUB_MCP_READ_CREDENTIAL_ID: "cred-github-read-123",
-      GITHUB_MCP_WRITE_CREDENTIAL_ID: "cred-github-write-456"
+      GITHUB_MCP_WRITE_CREDENTIAL_ID: "cred-github-write-456",
+      ALLOWED_REPOSITORIES: "owner/my-repo,owner/repo,facebook/react,org/repo"
     };
 
     it("1. Existing generic task-only calls still work and do not attach GitHub MCP", async () => {
@@ -3653,7 +3659,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const envWithoutReadCred = {
         ...env,
         GITHUB_MCP_READ_CREDENTIAL_ID: undefined,
-        GITHUB_MCP_WRITE_CREDENTIAL_ID: "write-id"
+        GITHUB_MCP_WRITE_CREDENTIAL_ID: "write-id",
+        ALLOWED_REPOSITORIES: "owner/repo"
       };
 
       await expect(
@@ -3672,7 +3679,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       // Test with empty string
       const envWithEmptyReadCred = {
         ...env,
-        GITHUB_MCP_READ_CREDENTIAL_ID: "   "
+        GITHUB_MCP_READ_CREDENTIAL_ID: "   ",
+        ALLOWED_REPOSITORIES: "owner/repo"
       };
       await expect(
         callAntigravityAgent(
@@ -3694,7 +3702,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const envWithoutWriteCred = {
         ...env,
         GITHUB_MCP_READ_CREDENTIAL_ID: "read-cred-id",
-        GITHUB_MCP_WRITE_CREDENTIAL_ID: undefined
+        GITHUB_MCP_WRITE_CREDENTIAL_ID: undefined,
+        ALLOWED_REPOSITORIES: "owner/repo"
       };
 
       // Ensure no silent fallback to read credential
@@ -3908,7 +3917,11 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       // 3. Missing credential
       const noCredHandler = createMcpHandler(() =>
-        createAntigravityMcpServer({ ...env, GEMINI_API_KEY: "test-fake-key" } as any)
+        createAntigravityMcpServer({
+          ...env,
+          GEMINI_API_KEY: "test-fake-key",
+          ALLOWED_REPOSITORIES: "owner/repo"
+        } as any)
       );
       const noCredText = await callTool(noCredHandler, {
         task: "missing cred test",
@@ -4576,6 +4589,695 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       expect(result.locked).toBe(true);
       expect(result.failures).toBeGreaterThan(PASSPHRASE_MAX_FAILURES);
+    });
+  });
+
+  describe("14. Owner admin credentials page", () => {
+    const ownerPassphrase = "admin-page-correct-horse-battery-4f8b2c9e1a";
+    const ownerId = "owner@example.com";
+    const adminUrl = "http://example.com/admin/credentials";
+
+    function adminEnv(overrides: Record<string, unknown> = {}) {
+      return {
+        ...env,
+        ALLOWED_USERS: ownerId,
+        OWNER_PASSPHRASE: ownerPassphrase,
+        CONSENT_CSRF_SECRET: "admin-page-consent-csrf-secret",
+        GEMINI_API_KEY: "admin-page-gemini-api-key",
+        MCP_RESOURCE: "http://example.com/mcp",
+        ...overrides
+      } as any;
+    }
+
+    async function callAdmin(request: Request, testEnv: any) {
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(request, testEnv, ctx);
+      await waitOnExecutionContext(ctx);
+      return res;
+    }
+
+    async function getAdminPage(testEnv: any) {
+      const res = await callAdmin(new Request(adminUrl), testEnv);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      const match = html.match(/name="csrf_token"\s+value="([^"]+)"/);
+      expect(match).not.toBeNull();
+      return { res, html, csrfToken: match![1] };
+    }
+
+    async function postAdmin(
+      testEnv: any,
+      fields: Record<string, string>
+    ) {
+      const form = new FormData();
+      for (const [key, value] of Object.entries(fields)) {
+        form.set(key, value);
+      }
+      return callAdmin(
+        new Request(adminUrl, { method: "POST", body: form }),
+        testEnv
+      );
+    }
+
+    async function postAction(testEnv: any, fields: Record<string, string>) {
+      const { csrfToken } = await getAdminPage(testEnv);
+      return postAdmin(testEnv, { csrf_token: csrfToken, ...fields });
+    }
+
+    async function clearAdminConfig() {
+      const page = await env.OAUTH_KV.list({ prefix: "antigravity:config:" });
+      for (const key of page.keys) {
+        await env.OAUTH_KV.delete(key.name);
+      }
+    }
+
+    beforeEach(async () => {
+      await clearAdminConfig();
+      await resetPassphraseThrottle(env as any);
+    });
+
+    it("returns 404 when passphrase mode is not configured and 405 for other methods", async () => {
+      const unconfigured = adminEnv({ OWNER_PASSPHRASE: undefined });
+
+      for (const method of ["GET", "POST"]) {
+        const res = await callAdmin(
+          new Request(adminUrl, {
+            method,
+            ...(method === "POST"
+              ? {
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: "x=1"
+                }
+              : {})
+          }),
+          unconfigured
+        );
+        expect(res.status).toBe(404);
+        expect(res.headers.get("Cache-Control")).toBe("no-store");
+      }
+
+      for (const method of ["PUT", "DELETE", "PATCH", "OPTIONS"]) {
+        const res = await callAdmin(new Request(adminUrl, { method }), unconfigured);
+        expect(res.status).toBe(405);
+      }
+
+      const configuredOther = await callAdmin(
+        new Request(adminUrl, { method: "PUT" }),
+        adminEnv()
+      );
+      expect(configuredOther.status).toBe(405);
+
+      const authSecretConfigured = await callAdmin(
+        new Request(adminUrl),
+        adminEnv({ AUTH_SECRET: "some-auth-secret" })
+      );
+      expect(authSecretConfigured.status).toBe(404);
+    });
+
+    it("rejects unexpected content types with 415 and bodies over 8 KB with 413", async () => {
+      const wrongType = await callAdmin(
+        new Request(adminUrl, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: "action=repos"
+        }),
+        adminEnv()
+      );
+      expect(wrongType.status).toBe(415);
+
+      const tooLarge = await callAdmin(
+        new Request(adminUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `action=repos&padding=${"x".repeat(9000)}`
+        }),
+        adminEnv()
+      );
+      expect(tooLarge.status).toBe(413);
+    });
+
+    it("renders status, allowed repositories, and all forms with a CSRF nonce and security headers", async () => {
+      await env.OAUTH_KV.put(
+        `${CREDENTIAL_KV_PREFIX}read`,
+        JSON.stringify({
+          id: "antigravity-github-read",
+          savedAt: "2024-05-06T12:34:56.000Z"
+        })
+      );
+      await env.OAUTH_KV.put(
+        ALLOWED_REPOSITORIES_KV_KEY,
+        JSON.stringify(["Owner/Repo", "other/repo"])
+      );
+
+      const { res, html, csrfToken } = await getAdminPage(adminEnv());
+
+      expect(res.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+      expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+      expect(res.headers.get("Content-Security-Policy")).toBe(
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+      );
+
+      expect(csrfToken).toBeTruthy();
+      expect(html).toContain("read: configured (2024-05-06)");
+      expect(html).toContain("write: not configured");
+      expect(html).toContain("owner/repo");
+      expect(html).toContain("other/repo");
+      expect(html).toContain('name="action" value="save"');
+      expect(html).toContain('name="action" value="delete"');
+      expect(html).toContain('name="action" value="repos"');
+      expect(html).toContain('name="slot"');
+      expect(html).toContain('name="token"');
+      expect(html).toContain('type="password"');
+      expect(html).toContain('name="repositories"');
+      expect(html).toContain("replace if exists");
+      expect(html).toContain('autocomplete="off"');
+      expect(html).not.toContain("ghp_");
+      expect(html).not.toContain("github_pat_");
+    });
+
+    it("rejects wrong passphrases, bad nonces, and malformed input with the same generic 400", async () => {
+      const envUnderTest = adminEnv();
+
+      const wrong = await postAction(envUnderTest, {
+        action: "repos",
+        repositories: "",
+        owner_passphrase: "definitely-the-wrong-admin-passphrase"
+      });
+      expect(wrong.status).toBe(400);
+      expect(await wrong.text()).toContain("Invalid request");
+
+      const missingNonce = await postAdmin(envUnderTest, {
+        action: "repos",
+        repositories: "",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(missingNonce.status).toBe(400);
+      expect(await missingNonce.text()).toContain("Invalid request");
+
+      await resetPassphraseThrottle(env as any);
+      const { csrfToken } = await getAdminPage(envUnderTest);
+      const first = await postAdmin(envUnderTest, {
+        csrf_token: csrfToken,
+        action: "repos",
+        repositories: "",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(first.status).toBe(200);
+
+      const replay = await postAdmin(envUnderTest, {
+        csrf_token: csrfToken,
+        action: "repos",
+        repositories: "",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(replay.status).toBe(400);
+      expect(await replay.text()).toContain("Invalid request");
+    });
+
+    it("records attempts before verification and returns 429 after the shared throttle limit", async () => {
+      const envUnderTest = adminEnv();
+
+      for (let i = 0; i < PASSPHRASE_MAX_FAILURES; i++) {
+        const res = await postAdmin(envUnderTest, {
+          csrf_token: "00".repeat(16),
+          action: "repos",
+          repositories: "",
+          owner_passphrase: ownerPassphrase
+        });
+        expect(res.status).toBe(400);
+      }
+
+      const locked = await postAction(envUnderTest, {
+        action: "repos",
+        repositories: "",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(locked.status).toBe(429);
+      expect(await locked.text()).toContain("Too many failed attempts");
+    });
+
+    it("fails closed with 429 when the throttle store errors", async () => {
+      const failingCoordinatorEnv = adminEnv({
+        CONSENT_COORDINATOR: {
+          idFromName: () => "passphrase-throttle-id",
+          get: () => ({
+            fetch: async () => new Response("unavailable", { status: 503 })
+          })
+        }
+      });
+
+      const res = await postAction(failingCoordinatorEnv, {
+        action: "repos",
+        repositories: "",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(res.status).toBe(429);
+    });
+
+    it("saves credentials at Google with fixed slot ids and stores only id and savedAt", async () => {
+      const token = "github_pat_ADMIN_DISTINCTIVE_TOKEN_MARKER_1234567890";
+      const fetchSpy = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async () => new Response("", { status: 200 }));
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const envUnderTest = adminEnv();
+
+      for (const slot of ["read", "write"] as const) {
+        const res = await postAction(envUnderTest, {
+          action: "save",
+          slot,
+          token,
+          owner_passphrase: ownerPassphrase
+        });
+        expect(res.status).toBe(200);
+        const text = await res.text();
+        expect(text).toContain("Credential saved.");
+        expect(text).not.toContain(token);
+
+        const storedText = await env.OAUTH_KV.get(`${CREDENTIAL_KV_PREFIX}${slot}`);
+        expect(storedText).not.toBeNull();
+        expect(storedText).not.toContain(token);
+        const stored = JSON.parse(storedText!);
+        expect(Object.keys(stored).sort()).toEqual(["id", "savedAt"]);
+        expect(stored.id).toBe(`antigravity-github-${slot}`);
+        expect(new Date(stored.savedAt).toISOString()).toBe(stored.savedAt);
+      }
+
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      for (const [index, slot] of (["read", "write"] as const).entries()) {
+        const [calledUrl, init] = fetchSpy.mock.calls[index];
+        expect(calledUrl).toBe(
+          "https://generativelanguage.googleapis.com/v1beta/credentials"
+        );
+        expect(init?.method).toBe("POST");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-goog-api-key")).toBe("admin-page-gemini-api-key");
+        expect(headers.get("Content-Type")).toBe("application/json");
+        expect(JSON.parse(init?.body as string)).toEqual({
+          id: `antigravity-github-${slot}`,
+          type: "bearer_token",
+          token
+        });
+      }
+
+      const logText = logSpy.mock.calls.flat().join("\n");
+      expect(logText).toContain("admin_credentials action=save slot=read  result=ok status=200");
+      expect(logText).toContain("admin_credentials action=save slot=write  result=ok status=200");
+      expect(logText).not.toContain(token);
+      expect(logText).not.toContain(ownerPassphrase);
+    });
+
+    it("rejects invalid token shapes without calling Google and never echoes the token", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const invalidTokens = [
+        "",
+        "ghp_short",
+        "ghp_" + "a".repeat(20) + " bad",
+        "ghp_" + "a".repeat(252),
+        "not_a_github_token_but_long_enough_12345",
+        "github_pat_" + "a".repeat(20) + "\nbad"
+      ];
+
+      for (const token of invalidTokens) {
+        const res = await postAction(adminEnv(), {
+          action: "save",
+          slot: "read",
+          token,
+          owner_passphrase: ownerPassphrase
+        });
+        expect(res.status).toBe(400);
+        const text = await res.text();
+        expect(text).toContain("Invalid GitHub token.");
+        if (token.length > 0) {
+          expect(text).not.toContain(token);
+        }
+      }
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("shows only a generic message and Google's status code for 4xx and 5xx responses", async () => {
+      const token = "ghp_ADMIN_GOOGLE_ERROR_TOKEN_MARKER_1234567890";
+      const statuses = [400, 500];
+      let call = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        const status = statuses[call++];
+        return new Response(`Google secret body ${token}`, { status });
+      });
+
+      for (const status of statuses) {
+        const res = await postAction(adminEnv(), {
+          action: "save",
+          slot: "read",
+          token,
+          owner_passphrase: ownerPassphrase
+        });
+        expect(res.status).toBe(502);
+        const text = await res.text();
+        expect(text).toContain(`HTTP ${status}`);
+        expect(text).not.toContain(token);
+        expect(text).not.toContain("Google secret body");
+      }
+    });
+
+    it("handles Google credential request timeouts generically", async () => {
+      const token = "ghp_ADMIN_TIMEOUT_TOKEN_MARKER_1234567890";
+      vi.spyOn(globalThis, "fetch").mockRejectedValue(
+        new DOMException("The operation was aborted due to timeout", "TimeoutError")
+      );
+
+      const res = await postAction(adminEnv(), {
+        action: "save",
+        slot: "read",
+        token,
+        owner_passphrase: ownerPassphrase
+      });
+      expect(res.status).toBe(502);
+      const text = await res.text();
+      expect(text).toContain("timed out");
+      expect(text).not.toContain(token);
+    });
+
+    it("shows the replace hint for an existing credential and deletes then recreates when ticked", async () => {
+      const token = "ghp_ADMIN_EXISTS_TOKEN_MARKER_1234567890";
+      const existsSpy = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async () => new Response("", { status: 409 }));
+
+      const hint = await postAction(adminEnv(), {
+        action: "save",
+        slot: "read",
+        token,
+        owner_passphrase: ownerPassphrase
+      });
+      expect(hint.status).toBe(200);
+      expect((await hint.text()).toLowerCase()).toContain("already exists, tick replace");
+      expect(existsSpy).toHaveBeenCalledTimes(1);
+      expect(existsSpy.mock.calls[0][1]?.method).toBe("POST");
+
+      vi.restoreAllMocks();
+      let createAttempts = 0;
+      const replaceSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+        if (init?.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        createAttempts++;
+        return new Response("", { status: createAttempts === 1 ? 409 : 200 });
+      });
+
+      const replaced = await postAction(adminEnv(), {
+        action: "save",
+        slot: "write",
+        token,
+        replace: "1",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(replaced.status).toBe(200);
+      expect(replaceSpy.mock.calls.map(([, init]) => init?.method)).toEqual([
+        "POST",
+        "DELETE",
+        "POST"
+      ]);
+      expect(String(replaceSpy.mock.calls[1][0])).toBe(
+        "https://generativelanguage.googleapis.com/v1beta/credentials/antigravity-github-write"
+      );
+      const stored = await env.OAUTH_KV.get(`${CREDENTIAL_KV_PREFIX}write`, {
+        type: "json"
+      });
+      expect(stored).toEqual(
+        expect.objectContaining({ id: "antigravity-github-write" })
+      );
+    });
+
+    it("deletes the fixed Google credential and removes the KV record, treating not-found as success", async () => {
+      for (const status of [204, 404]) {
+        await env.OAUTH_KV.put(
+          `${CREDENTIAL_KV_PREFIX}read`,
+          JSON.stringify({
+            id: "antigravity-github-read",
+            savedAt: "2024-05-06T12:34:56.000Z"
+          })
+        );
+
+        const fetchSpy = vi
+          .spyOn(globalThis, "fetch")
+          .mockImplementation(async () => new Response(null, { status }));
+
+        const res = await postAction(adminEnv(), {
+          action: "delete",
+          slot: "read",
+          owner_passphrase: ownerPassphrase
+        });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toContain("Credential deleted.");
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        const [calledUrl, init] = fetchSpy.mock.calls[0];
+        expect(String(calledUrl)).toBe(
+          "https://generativelanguage.googleapis.com/v1beta/credentials/antigravity-github-read"
+        );
+        expect(init?.method).toBe("DELETE");
+        expect(new Headers(init?.headers).get("x-goog-api-key")).toBe(
+          "admin-page-gemini-api-key"
+        );
+        expect(await env.OAUTH_KV.get(`${CREDENTIAL_KV_PREFIX}read`)).toBeNull();
+
+        vi.restoreAllMocks();
+      }
+    });
+
+    it("parses, validates, lowercases, deduplicates, and stores allowed repositories", async () => {
+      const save = await postAction(adminEnv(), {
+        action: "repos",
+        repositories: "Owner/Repo\nother/repo\nOWNER/REPO\n\n",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(save.status).toBe(200);
+      expect(JSON.parse((await env.OAUTH_KV.get(ALLOWED_REPOSITORIES_KV_KEY))!)).toEqual([
+        "owner/repo",
+        "other/repo"
+      ]);
+
+      const invalid = await postAction(adminEnv(), {
+        action: "repos",
+        repositories: "owner/repo\nnot a repo",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.text()).toContain("Invalid repository list.");
+      expect(JSON.parse((await env.OAUTH_KV.get(ALLOWED_REPOSITORIES_KV_KEY))!)).toEqual([
+        "owner/repo",
+        "other/repo"
+      ]);
+
+      const tooMany = Array.from({ length: 51 }, (_, i) => `owner/repo${i}`).join("\n");
+      const overflow = await postAction(adminEnv(), {
+        action: "repos",
+        repositories: tooMany,
+        owner_passphrase: ownerPassphrase
+      });
+      expect(overflow.status).toBe(400);
+
+      const exactlyFifty = Array.from({ length: 50 }, (_, i) => `owner/repo${i}`).join("\n");
+      const accepted = await postAction(adminEnv(), {
+        action: "repos",
+        repositories: exactlyFifty,
+        owner_passphrase: ownerPassphrase
+      });
+      expect(accepted.status).toBe(200);
+      expect(
+        (JSON.parse((await env.OAUTH_KV.get(ALLOWED_REPOSITORIES_KV_KEY))!) as string[]).length
+      ).toBe(50);
+
+      const cleared = await postAction(adminEnv(), {
+        action: "repos",
+        repositories: "",
+        owner_passphrase: ownerPassphrase
+      });
+      expect(cleared.status).toBe(200);
+      expect(await env.OAUTH_KV.get(ALLOWED_REPOSITORIES_KV_KEY, { type: "json" })).toEqual([]);
+    });
+
+    it("prefers environment credential ids over KV, falls back to KV, and fails closed when neither exists", async () => {
+      await env.OAUTH_KV.put(
+        `${CREDENTIAL_KV_PREFIX}read`,
+        JSON.stringify({ id: "kv-read", savedAt: "2024-05-06T12:34:56.000Z" })
+      );
+      await env.OAUTH_KV.put(
+        `${CREDENTIAL_KV_PREFIX}write`,
+        JSON.stringify({ id: "kv-write", savedAt: "2024-05-06T12:34:56.000Z" })
+      );
+
+      const fetchSpy = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async () =>
+          Response.json({ id: "int-cred", status: "completed" }, { status: 200 })
+        );
+
+      const envWithIds = adminEnv({
+        GITHUB_MCP_READ_CREDENTIAL_ID: "env-read",
+        GITHUB_MCP_WRITE_CREDENTIAL_ID: "env-write",
+        ALLOWED_REPOSITORIES: "owner/repo"
+      });
+      await createInteraction(
+        "google-key",
+        {
+          prompt: "Credential precedence",
+          repoContext: { repository: "OWNER/REPO", mode: "inspect" }
+        },
+        envWithIds
+      );
+      let payload = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+      let githubTool = payload.tools.find((tool: any) => tool.type === "mcp_server");
+      expect(githubTool.credential).toBe("env-read");
+
+      await createInteraction(
+        "google-key",
+        {
+          prompt: "Write credential precedence",
+          repoContext: { repository: "owner/repo", mode: "implement" }
+        },
+        envWithIds
+      );
+      payload = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string);
+      githubTool = payload.tools.find((tool: any) => tool.type === "mcp_server");
+      expect(githubTool.credential).toBe("env-write");
+
+      const kvOnlyEnv = adminEnv({
+        GITHUB_MCP_READ_CREDENTIAL_ID: undefined,
+        GITHUB_MCP_WRITE_CREDENTIAL_ID: undefined,
+        ALLOWED_REPOSITORIES: "owner/repo"
+      });
+      await createInteraction(
+        "google-key",
+        {
+          prompt: "KV credential",
+          repoContext: { repository: "owner/repo", mode: "inspect" }
+        },
+        kvOnlyEnv
+      );
+      payload = JSON.parse(fetchSpy.mock.calls[2][1]?.body as string);
+      githubTool = payload.tools.find((tool: any) => tool.type === "mcp_server");
+      expect(githubTool.credential).toBe("kv-read");
+
+      const noCredentialEnv = adminEnv({
+        GITHUB_MCP_READ_CREDENTIAL_ID: undefined,
+        GITHUB_MCP_WRITE_CREDENTIAL_ID: undefined,
+        ALLOWED_REPOSITORIES: "owner/repo"
+      });
+      await env.OAUTH_KV.delete(`${CREDENTIAL_KV_PREFIX}read`);
+      await env.OAUTH_KV.delete(`${CREDENTIAL_KV_PREFIX}write`);
+      const callsBefore = fetchSpy.mock.calls.length;
+      await expect(
+        createInteraction(
+          "google-key",
+          {
+            prompt: "No credential",
+            repoContext: { repository: "owner/repo", mode: "inspect" }
+          },
+          noCredentialEnv
+        )
+      ).rejects.toThrow(
+        "Missing required credential configuration: GITHUB_MCP_READ_CREDENTIAL_ID is not configured"
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(callsBefore);
+    });
+
+    it("rejects repositories outside the allowlist before any Google call or credential lookup", async () => {
+      const getSpy = vi.fn(async (key: string) => {
+        if (key === ALLOWED_REPOSITORIES_KV_KEY) return ["other/repo"];
+        if (key === `${CREDENTIAL_KV_PREFIX}read`) {
+          return { id: "kv-read", savedAt: "2024-05-06T12:34:56.000Z" };
+        }
+        return null;
+      });
+      const testEnv = adminEnv({
+        OAUTH_KV: { get: getSpy, put: vi.fn(), delete: vi.fn(), list: vi.fn() },
+        ALLOWED_REPOSITORIES: undefined,
+        GITHUB_MCP_READ_CREDENTIAL_ID: undefined
+      });
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      await expect(
+        createInteraction(
+          "google-key",
+          {
+            prompt: "Blocked repository",
+            repoContext: { repository: "owner/repo", mode: "inspect" }
+          },
+          testEnv
+        )
+      ).rejects.toThrow(/not allowed.*\/admin\/credentials/);
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(
+        getSpy.mock.calls.some(([key]) => String(key).startsWith(CREDENTIAL_KV_PREFIX))
+      ).toBe(false);
+    });
+
+    it("denies every repository when the allowlist is empty or KV reads fail", async () => {
+      const emptyEnv = adminEnv({
+        GITHUB_MCP_READ_CREDENTIAL_ID: "env-read",
+        ALLOWED_REPOSITORIES: ""
+      });
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      await expect(
+        createInteraction(
+          "google-key",
+          {
+            prompt: "Empty allowlist",
+            repoContext: { repository: "owner/repo", mode: "inspect" }
+          },
+          emptyEnv
+        )
+      ).rejects.toThrow(/\/admin\/credentials/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      const failingKvEnv = adminEnv({
+        GITHUB_MCP_READ_CREDENTIAL_ID: "env-read",
+        ALLOWED_REPOSITORIES: undefined,
+        OAUTH_KV: {
+          get: vi.fn().mockRejectedValue(new Error("kv down")),
+          put: vi.fn(),
+          delete: vi.fn(),
+          list: vi.fn()
+        }
+      });
+      await expect(
+        createInteraction(
+          "google-key",
+          {
+            prompt: "KV failure",
+            repoContext: { repository: "owner/repo", mode: "inspect" }
+          },
+          failingKvEnv
+        )
+      ).rejects.toThrow(/\/admin\/credentials/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("includeSteps keeps the last 100 steps and reports omittedSteps", () => {
+      const steps: any[] = [];
+      for (let i = 0; i < 105; i++) {
+        steps.push({ type: "mcp_server_tool_call", name: `step_${i}` });
+        if (i % 10 === 0) {
+          steps.push({ type: "thought", signature: `thought-${i}` });
+        }
+      }
+
+      const parsed = JSON.parse(
+        formatTaskResult(
+          { id: "int-last-steps", status: "completed", steps },
+          { includeSteps: true }
+        )
+      );
+
+      expect(parsed.steps.length).toBe(100);
+      expect(parsed.steps[0].name).toBe("step_5");
+      expect(parsed.steps[99].name).toBe("step_104");
+      expect(parsed.omittedSteps).toBe(5);
+      expect(JSON.stringify(parsed.steps)).not.toContain("thought");
     });
   });
 });
