@@ -315,6 +315,7 @@ export function sanitizeSecret(text: string, secret?: string): string {
 }
 
 export const INTERACTIONS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
+export const INTERACTIONS_API_REVISION = "2026-05-20";
 export const DEFAULT_INTERACTION_TIMEOUT_MS = 60000;
 export const TASK_INDEX_PREFIX = "antigravity:task:";
 export const TASK_RECENT_INDEX_PREFIX = "antigravity:recent:";
@@ -375,6 +376,20 @@ export function validateTaskId(taskId: unknown): string {
 
 export function taskIndexKey(taskId: string): string {
   return `${TASK_INDEX_PREFIX}${taskId}`;
+}
+
+function buildInteractionHeaders(
+  apiKey: string,
+  includeContentType = false
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "x-goog-api-key": apiKey,
+    "Api-Revision": INTERACTIONS_API_REVISION
+  };
+  if (includeContentType) {
+    headers["Content-Type"] = "application/json";
+  }
+  return headers;
 }
 
 export function taskRecentIndexKey(createdAt: string, taskId: string): string {
@@ -666,10 +681,7 @@ export async function createInteraction(
     INTERACTIONS_BASE_URL,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey
-      },
+      headers: buildInteractionHeaders(apiKey, true),
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs)
     },
@@ -702,9 +714,7 @@ export async function getInteraction(
     `${INTERACTIONS_BASE_URL}/${encodeURIComponent(id)}`,
     {
       method: "GET",
-      headers: {
-        "x-goog-api-key": apiKey
-      },
+      headers: buildInteractionHeaders(apiKey),
       signal: AbortSignal.timeout(timeoutMs)
     },
     apiKey,
@@ -737,9 +747,7 @@ export async function cancelInteraction(
     `${INTERACTIONS_BASE_URL}/${encodeURIComponent(id)}/cancel`,
     {
       method: "POST",
-      headers: {
-        "x-goog-api-key": apiKey
-      },
+      headers: buildInteractionHeaders(apiKey),
       signal: AbortSignal.timeout(timeoutMs)
     },
     apiKey,
@@ -828,10 +836,7 @@ export async function callAntigravityAgent(
     INTERACTIONS_BASE_URL,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey
-      },
+      headers: buildInteractionHeaders(apiKey, true),
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs)
     },
