@@ -7,7 +7,7 @@ A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It 
 - **Google Antigravity Integration**: Connects to Google's official Interactions API endpoint `https://generativelanguage.googleapis.com/v1beta/interactions` using the supported agent identifier `antigravity-preview-09-2026` and official `x-goog-api-key: <GEMINI_API_KEY>` header.
 - **GitHub Official Remote MCP Integration**: Directly registers GitHub's official remote MCP endpoint (`https://api.githubcopilot.com/mcp/`) within Google Interactions API's `tools` array as an `mcp_server` authenticated via Google-managed credential IDs. No custom GitHub server or proxy required.
 - **Controlled Operational Modes**: Restricts GitHub MCP tools across 4 explicit modes (`inspect`, `review`, `propose`, `implement`) using both Google's `allowed_tools` and GitHub remote headers (`X-MCP-Tools`, `X-MCP-Readonly`, `X-MCP-Exclude-Tools`).
-- **MCP Server & Tool**: Implements the `run_antigravity_agent` tool via official SDK v2 (`@modelcontextprotocol/server`) to execute multi-step tasks and file manipulation within the sandbox workspace.
+- **MCP Server & Async Task Tools**: Implements `run_antigravity_agent`, `start_antigravity_task`, `get_antigravity_task`, `cancel_antigravity_task`, and `list_antigravity_tasks` via official SDK v2 (`@modelcontextprotocol/server`). Tasks run in Google background mode (`background: true`, `store: true`) so long-running work can outlive a single MCP request.
 - **Stateless Web-Standard MCP Transport**: Exposes the primary remote MCP endpoint at `/mcp` via `createMcpHandler()`, providing native support for MCP 2026-07-28 and 2025 stateless fallback over POST without requiring transport session state.
 - **Protected Resource Metadata (RFC 9728)**: Exposes discovery at `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-protected-resource`, and supplies `resource_metadata` in 401 `WWW-Authenticate` response headers.
 - **Identity Verification & Security**: Supports Cloudflare Access JWT validation (`Cf-Access-Jwt-Assertion` validated against official Access JWKS) and HMAC-signed identity proxy verification (`AUTH_SECRET`). Never trusts unverified raw email headers.
@@ -315,8 +315,51 @@ Executes autonomous multi-step reasoning, test suites, or file transformations i
   pullRequest?: number;          // Optional positive integer pull request number to inspect/review
   baseBranch?: string;           // Optional target base branch for implementation
   mode?: "inspect" | "review" | "propose" | "implement"; // Operating mode (default: "inspect")
+  waitSeconds?: number;          // Integer 0-90 (default 45) to wait before returning an in-progress task id
 }
 ```
+
+### Async task tools
+
+Task ids match `^[A-Za-z0-9_-]{1,200}$`. Indexed tasks are stored under the `antigravity:task:` prefix in `OAUTH_KV` with a 30-day TTL. Indexing is best effort: a KV failure never fails a tool call. Statuses shown by `list_antigravity_tasks` are as of the last time each task was fetched.
+
+#### `start_antigravity_task`
+
+Takes the same inputs as `run_antigravity_agent` except `waitSeconds`. Creates a background interaction and returns `taskId` and `status` immediately. Long tasks: call `get_antigravity_task` with the taskId until `done` is true.
+
+#### `get_antigravity_task`
+
+```typescript
+{
+  taskId: string;
+  waitSeconds?: number;          // Integer 0-90 (default 20)
+  offset?: number;               // Character offset for paging output text
+  includeRaw?: boolean;          // Include sanitized raw interaction JSON
+}
+```
+
+Fetches the task, waits briefly if it is still running, and returns the formatted result. Output text is capped at 60,000 characters per response; use `offset` and `nextOffset` to page. When a completed interaction has no `output_text`, the sanitized raw interaction is returned as `rawFallback`.
+
+#### `cancel_antigravity_task`
+
+```typescript
+{
+  taskId: string;
+}
+```
+
+Calls `POST /interactions/<id>/cancel`. Cancelling an already-finished task returns its current status without failing.
+
+#### `list_antigravity_tasks`
+
+```typescript
+{
+  limit?: number;                // Integer 1-50 (default 20)
+  status?: string;               // Optional status filter
+}
+```
+
+Lists indexed tasks newest first with `taskId`, `status`, `createdAt`, `mode`, and `taskPreview` per item, using KV list metadata and following KV cursors up to 1,000 scanned keys.
 
 ### Operating Modes & GitHub Tool Restrictions
 
