@@ -547,10 +547,25 @@ async function buildInteractionPayload(
       type: "mcp_server",
       name: "github",
       url: GITHUB_MCP_REMOTE_URL,
-      credential: credId,
       headers: mcpHeaders,
       allowed_tools: allowedTools
     };
+
+    const repoEnvironment: Record<string, any> = {
+      type: "remote",
+      network: {
+        allowlist: [
+          {
+            domain: "api.githubcopilot.com",
+            credential: credId
+          }
+        ]
+      }
+    };
+    if (sources.length > 0) {
+      repoEnvironment.sources = sources;
+    }
+    payload.environment = repoEnvironment;
 
     // Preserve native capabilities alongside GitHub MCP server
     payload.tools = [
