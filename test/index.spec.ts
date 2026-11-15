@@ -38,7 +38,11 @@ import worker, {
   validateTaskId,
   taskIndexKey,
   TASK_INDEX_PREFIX,
-  MAX_OUTPUT_CHARS
+  TASK_RECENT_INDEX_PREFIX,
+  taskRecentIndexKey,
+  MAX_OUTPUT_CHARS,
+  MAX_TASK_METADATA_BYTES,
+  MAX_TASK_METADATA_PREVIEW_CHARS
 } from "../src/index";
 import {
   env,
@@ -288,6 +292,32 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(result.output_text).toBe("Task finished!");
     });
 
+    it("retries polling after two consecutive failures and resets the counter on success", async () => {
+      let callCount = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) {
+          return Response.json({ id: "int-poll-retry", status: "in_progress" }, { status: 200 });
+        }
+        if (callCount <= 3) {
+          throw new Error(`poll failure ${callCount}`);
+        }
+        return Response.json(
+          { id: "int-poll-retry", status: "completed", output_text: "Recovered after retries" },
+          { status: 200 }
+        );
+      });
+
+      const result = await callAntigravityAgent("fake_key", "prompt", undefined, {
+        maxPollIntervalMs: 5,
+        maxPollTimeMs: 1000
+      });
+
+      expect(callCount).toBe(4);
+      expect(result.status).toBe("completed");
+      expect(result.output_text).toBe("Recovered after retries");
+    });
+
     it("rejects incomplete interaction status when budget or token limit was reached", async () => {
       vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
         return Response.json(
@@ -448,14 +478,16 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
     }
 
     async function clearTaskIndex() {
-      let cursor: string | undefined;
-      do {
-        const page = await env.OAUTH_KV.list({ prefix: TASK_INDEX_PREFIX, cursor });
-        for (const key of page.keys) {
-          await env.OAUTH_KV.delete(key.name);
-        }
-        cursor = page.list_complete ? undefined : page.cursor;
-      } while (cursor);
+      for (const prefix of [TASK_INDEX_PREFIX, TASK_RECENT_INDEX_PREFIX]) {
+        let cursor: string | undefined;
+        do {
+          const page = await env.OAUTH_KV.list({ prefix, cursor });
+          for (const key of page.keys) {
+            await env.OAUTH_KV.delete(key.name);
+          }
+          cursor = page.list_complete ? undefined : page.cursor;
+        } while (cursor);
+      }
     }
 
     async function callTool(handler: any, name: string, args: any) {
@@ -548,6 +580,78 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(running.data.status).toBe("in_progress");
       expect(running.data.taskId).toBe("int-run-live");
       expect(running.text).toContain("get_antigravity_task");
+    });
+
+    it("run_antigravity_agent returns a non-error in-progress result when polling keeps failing", async () => {
+      vi.useFakeTimers();
+      try {
+        const handler = await makeHandler();
+        let call = 0;
+        const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+          call++;
+          if (call === 1) {
+            return Response.json(
+              { id: "int-run-poll-fail", status: "in_progress" },
+              { status: 200 }
+            );
+          }
+          throw new Error("polling backend unavailable");
+        });
+
+        const pending = callTool(handler, "run_antigravity_agent", {
+          task: "Poll failures",
+          waitSeconds: 20
+        });
+        await vi.advanceTimersByTimeAsync(5000);
+        const result = await pending;
+
+        expect(fetchSpy).toHaveBeenCalledTimes(4);
+        expect(result.isError).toBe(false);
+        expect(result.data.taskId).toBe("int-run-poll-fail");
+        expect(result.data.status).toBe("in_progress");
+        expect(result.data.done).toBe(false);
+        expect(typeof result.data.warning).toBe("string");
+        expect(result.data.warning.length).toBeLessThanOrEqual(200);
+        expect(result.data.warning).toContain("polling backend unavailable");
+        expect(result.text).toContain("get_antigravity_task");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("get_antigravity_task returns the last known state when polling keeps failing", async () => {
+      vi.useFakeTimers();
+      try {
+        const handler = await makeHandler();
+        let call = 0;
+        const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+          call++;
+          if (call === 1) {
+            return Response.json(
+              { id: "int-get-poll-fail", status: "in_progress" },
+              { status: 200 }
+            );
+          }
+          throw new Error("polling backend unavailable");
+        });
+
+        const pending = callTool(handler, "get_antigravity_task", {
+          taskId: "int-get-poll-fail",
+          waitSeconds: 20
+        });
+        await vi.advanceTimersByTimeAsync(5000);
+        const result = await pending;
+
+        expect(fetchSpy).toHaveBeenCalledTimes(4);
+        expect(result.isError).toBe(false);
+        expect(result.data.taskId).toBe("int-get-poll-fail");
+        expect(result.data.status).toBe("in_progress");
+        expect(result.data.done).toBe(false);
+        expect(result.data.warning).toContain("polling backend unavailable");
+        expect(result.text).toContain("get_antigravity_task");
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("run_antigravity_agent returns isError for failed and cancelled tasks", async () => {
@@ -712,42 +816,125 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(refreshedMetadata.status).toBe("completed");
     });
 
-    it("list_antigravity_tasks sorts newest first, filters, limits, and follows KV cursors", async () => {
+    it("writes the recent index on create and rewrites it when status changes", async () => {
+      const handler = await makeHandler();
+      let call = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        call++;
+        if (call === 1) {
+          return Response.json(
+            { id: "int-recent-index", status: "in_progress" },
+            { status: 200 }
+          );
+        }
+        return Response.json(
+          { id: "int-recent-index", status: "completed", output_text: "done" },
+          { status: 200 }
+        );
+      });
+
+      const started = await callTool(handler, "start_antigravity_task", {
+        task: "Recent index task"
+      });
+      expect(started.isError).toBe(false);
+
+      const record = (await env.OAUTH_KV.get(taskIndexKey("int-recent-index"), {
+        type: "json"
+      })) as any;
+      const recentKey = taskRecentIndexKey(record.createdAt, "int-recent-index");
+      expect(recentKey.startsWith(TASK_RECENT_INDEX_PREFIX)).toBe(true);
+      const suffix = recentKey.slice(TASK_RECENT_INDEX_PREFIX.length);
+      expect(suffix.slice(0, 13)).toMatch(/^\d{13}$/);
+      expect(suffix.slice(13)).toBe(":int-recent-index");
+
+      const initial = await env.OAUTH_KV.getWithMetadata(recentKey, { type: "json" });
+      expect((initial.value as any).taskId).toBe("int-recent-index");
+      expect((initial.metadata as any).status).toBe("in_progress");
+
+      const fetched = await callTool(handler, "get_antigravity_task", {
+        taskId: "int-recent-index",
+        waitSeconds: 0
+      });
+      expect(fetched.data.status).toBe("completed");
+
+      const refreshed = await env.OAUTH_KV.getWithMetadata(recentKey, { type: "json" });
+      expect((refreshed.value as any).status).toBe("completed");
+      expect((refreshed.metadata as any).status).toBe("completed");
+    });
+
+    it("caps KV metadata previews for Arabic and emoji without splitting characters", async () => {
+      const handler = await makeHandler();
+      const tasks = [
+        { id: "int-preview-arabic", task: "مهمة عربية ".repeat(60) },
+        { id: "int-preview-emoji", task: "🚀".repeat(200) }
+      ];
+      let call = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        const current = tasks[call++];
+        return Response.json({ id: current.id, status: "in_progress" }, { status: 200 });
+      });
+
+      for (const entry of tasks) {
+        const started = await callTool(handler, "start_antigravity_task", { task: entry.task });
+        expect(started.isError).toBe(false);
+      }
+
+      for (const entry of tasks) {
+        const record = (await env.OAUTH_KV.get(taskIndexKey(entry.id), {
+          type: "json"
+        })) as any;
+        const recentKey = taskRecentIndexKey(record.createdAt, entry.id);
+        const stored = await env.OAUTH_KV.getWithMetadata(recentKey, { type: "json" });
+        const metadata = stored.metadata as any;
+
+        expect(Array.from(metadata.taskPreview).length).toBeLessThanOrEqual(
+          MAX_TASK_METADATA_PREVIEW_CHARS
+        );
+        expect(metadata.taskPreview.length).toBeLessThanOrEqual(
+          MAX_TASK_METADATA_PREVIEW_CHARS
+        );
+        expect(new TextEncoder().encode(JSON.stringify(metadata)).length).toBeLessThanOrEqual(
+          MAX_TASK_METADATA_BYTES
+        );
+        expect(metadata.taskPreview).not.toContain("\uFFFD");
+        expect(entry.task.startsWith(metadata.taskPreview)).toBe(true);
+      }
+
+      const arabicRecord = (await env.OAUTH_KV.get(taskIndexKey("int-preview-arabic"), {
+        type: "json"
+      })) as any;
+      const arabicStored = await env.OAUTH_KV.getWithMetadata(
+        taskRecentIndexKey(arabicRecord.createdAt, "int-preview-arabic"),
+        { type: "json" }
+      );
+      expect(Array.from((arabicStored.metadata as any).taskPreview).length).toBe(
+        MAX_TASK_METADATA_PREVIEW_CHARS
+      );
+    });
+
+    it("list_antigravity_tasks reads recent keys newest first, filters, limits, and follows KV cursors", async () => {
+      const recentKey = (
+        createdAt: string,
+        taskId: string,
+        status: string,
+        mode: string,
+        taskPreview: string
+      ) => ({
+        name: taskRecentIndexKey(createdAt, taskId),
+        metadata: { createdAt, status, mode, taskPreview }
+      });
+
       const listMock = vi.fn();
       listMock.mockResolvedValueOnce({
         keys: [
-          {
-            name: `${TASK_INDEX_PREFIX}old-task`,
-            metadata: {
-              createdAt: "2026-01-01T00:00:00.000Z",
-              status: "completed",
-              mode: "plain",
-              taskPreview: "old"
-            }
-          },
-          {
-            name: `${TASK_INDEX_PREFIX}mid-task`,
-            metadata: {
-              createdAt: "2026-02-01T00:00:00.000Z",
-              status: "in_progress",
-              mode: "inspect",
-              taskPreview: "mid"
-            }
-          }
+          recentKey("2026-03-01T00:00:00.000Z", "new-task", "completed", "review", "new")
         ],
         cursor: "cursor-1"
       });
       listMock.mockResolvedValueOnce({
         keys: [
-          {
-            name: `${TASK_INDEX_PREFIX}new-task`,
-            metadata: {
-              createdAt: "2026-03-01T00:00:00.000Z",
-              status: "completed",
-              mode: "review",
-              taskPreview: "new"
-            }
-          }
+          recentKey("2026-02-01T00:00:00.000Z", "mid-task", "in_progress", "inspect", "mid"),
+          recentKey("2026-01-01T00:00:00.000Z", "old-task", "completed", "plain", "old")
         ]
       });
       const handler = await makeHandler({
@@ -758,6 +945,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       const limited = await callTool(handler, "list_antigravity_tasks", { limit: 2 });
       expect(limited.isError).toBe(false);
       expect(listMock).toHaveBeenCalledTimes(2);
+      expect(listMock.mock.calls[0][0].prefix).toBe(TASK_RECENT_INDEX_PREFIX);
       expect(limited.data.tasks.map((t: any) => t.taskId)).toEqual(["new-task", "mid-task"]);
       expect(limited.data.tasks[0]).toEqual({
         taskId: "new-task",
@@ -769,31 +957,73 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
 
       listMock.mockResolvedValue({
         keys: [
-          {
-            name: `${TASK_INDEX_PREFIX}old-task`,
-            metadata: {
-              createdAt: "2026-01-01T00:00:00.000Z",
-              status: "completed",
-              mode: "plain",
-              taskPreview: "old"
-            }
-          },
-          {
-            name: `${TASK_INDEX_PREFIX}mid-task`,
-            metadata: {
-              createdAt: "2026-02-01T00:00:00.000Z",
-              status: "in_progress",
-              mode: "inspect",
-              taskPreview: "mid"
-            }
-          }
+          recentKey("2026-03-01T00:00:00.000Z", "new-task", "completed", "review", "new"),
+          recentKey("2026-02-01T00:00:00.000Z", "mid-task", "in_progress", "inspect", "mid"),
+          recentKey("2026-01-01T00:00:00.000Z", "old-task", "completed", "plain", "old")
         ]
       });
       const filtered = await callTool(handler, "list_antigravity_tasks", {
         limit: 50,
         status: "completed"
       });
-      expect(filtered.data.tasks.map((t: any) => t.taskId)).toEqual(["old-task"]);
+      expect(filtered.data.tasks.map((t: any) => t.taskId)).toEqual(["new-task", "old-task"]);
+    });
+
+    it("list_antigravity_tasks filters status while scanning recent keys and stops at the limit", async () => {
+      const listMock = vi.fn().mockResolvedValue({
+        keys: [
+          {
+            name: taskRecentIndexKey("2026-04-01T00:00:00.000Z", "newest-running"),
+            metadata: {
+              createdAt: "2026-04-01T00:00:00.000Z",
+              status: "in_progress",
+              mode: "plain",
+              taskPreview: "running"
+            }
+          },
+          {
+            name: taskRecentIndexKey("2026-03-01T00:00:00.000Z", "newest-done"),
+            metadata: {
+              createdAt: "2026-03-01T00:00:00.000Z",
+              status: "completed",
+              mode: "plain",
+              taskPreview: "done"
+            }
+          },
+          {
+            name: taskRecentIndexKey("2026-02-01T00:00:00.000Z", "older-running"),
+            metadata: {
+              createdAt: "2026-02-01T00:00:00.000Z",
+              status: "in_progress",
+              mode: "plain",
+              taskPreview: "running again"
+            }
+          },
+          {
+            name: taskRecentIndexKey("2026-01-01T00:00:00.000Z", "oldest-done"),
+            metadata: {
+              createdAt: "2026-01-01T00:00:00.000Z",
+              status: "completed",
+              mode: "plain",
+              taskPreview: "done too"
+            }
+          }
+        ]
+      });
+      const handler = await makeHandler({
+        ...taskEnv,
+        OAUTH_KV: { list: listMock, get: vi.fn(), put: vi.fn(), delete: vi.fn() }
+      });
+
+      const result = await callTool(handler, "list_antigravity_tasks", {
+        limit: 2,
+        status: "completed"
+      });
+
+      expect(result.isError).toBe(false);
+      expect(listMock).toHaveBeenCalledTimes(1);
+      expect(listMock.mock.calls[0][0].prefix).toBe(TASK_RECENT_INDEX_PREFIX);
+      expect(result.data.tasks.map((t: any) => t.taskId)).toEqual(["newest-done", "oldest-done"]);
     });
 
     it("KV get, put, and list failures never fail start, run, get, or list", async () => {

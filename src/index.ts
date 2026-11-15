@@ -232,20 +232,8 @@ export interface AntigravityOptions {
   timeoutMs?: number;
   maxPollIntervalMs?: number;
   maxPollTimeMs?: number;
-  maxPolls?: number;
   store?: boolean;
 }
-
-const VALID_INTERACTION_STATUSES = [
-  "completed",
-  "in_progress",
-  "requires_action",
-  "failed",
-  "cancelled",
-  "incomplete"
-] as const;
-
-type InteractionStatus = (typeof VALID_INTERACTION_STATUSES)[number];
 
 const TERMINAL_INTERACTION_STATUSES = new Set<string>([
   "completed",
@@ -328,11 +316,17 @@ export function sanitizeSecret(text: string, secret?: string): string {
 export const INTERACTIONS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 export const DEFAULT_INTERACTION_TIMEOUT_MS = 60000;
 export const TASK_INDEX_PREFIX = "antigravity:task:";
+export const TASK_RECENT_INDEX_PREFIX = "antigravity:recent:";
 export const TASK_INDEX_TTL_SECONDS = 30 * 24 * 60 * 60;
 export const MAX_OUTPUT_CHARS = 60000;
 export const MAX_TASK_PREVIEW_CHARS = 200;
+export const MAX_TASK_METADATA_PREVIEW_CHARS = 120;
+export const MAX_TASK_METADATA_BYTES = 800;
+export const MAX_TASK_WARNING_CHARS = 200;
+export const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 export const MAX_TASK_ERROR_CHARS = 500;
 export const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+const REVERSE_TIMESTAMP_MAX = 9999999999999;
 
 export type AntigravityTaskIndexMode = AntigravityTaskMode | "plain";
 
@@ -379,6 +373,13 @@ export function validateTaskId(taskId: unknown): string {
 
 export function taskIndexKey(taskId: string): string {
   return `${TASK_INDEX_PREFIX}${taskId}`;
+}
+
+export function taskRecentIndexKey(createdAt: string, taskId: string): string {
+  const parsed = Date.parse(createdAt);
+  const timestamp = Number.isFinite(parsed) ? parsed : 0;
+  const reverseTs = String(REVERSE_TIMESTAMP_MAX - timestamp).padStart(13, "0");
+  return `${TASK_RECENT_INDEX_PREFIX}${reverseTs}:${taskId}`;
 }
 
 function buildInteractionPayload(
@@ -693,6 +694,7 @@ export async function waitForInteraction(
 
   const deadline = Date.now() + Math.max(0, waitMs);
   const interval = Math.max(0, pollIntervalMs);
+  let consecutiveFailures = 0;
 
   while (!isTerminalInteractionStatus(data.status) && Date.now() < deadline) {
     if (!data.id) {
@@ -703,7 +705,15 @@ export async function waitForInteraction(
       break;
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(interval, remaining)));
-    data = await getInteraction(apiKey, String(data.id));
+    try {
+      data = await getInteraction(apiKey, String(data.id));
+      consecutiveFailures = 0;
+    } catch (err) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+        throw err;
+      }
+    }
   }
 
   return data;
@@ -885,6 +895,39 @@ function safeTaskPreview(task: string): string {
   return typeof task === "string" ? task.slice(0, MAX_TASK_PREVIEW_CHARS) : "";
 }
 
+function truncateCharacters(text: string, maxChars: number): string {
+  let result = "";
+  for (const char of Array.from(text)) {
+    if (result.length + char.length > maxChars) break;
+    result += char;
+  }
+  return result;
+}
+
+function taskIndexMetadata(record: AntigravityTaskIndexRecord): Record<string, string> {
+  const encoder = new TextEncoder();
+  const metadata: Record<string, string> = {
+    createdAt: record.createdAt,
+    status: record.status,
+    mode: record.mode,
+    taskPreview: truncateCharacters(
+      typeof record.taskPreview === "string" ? record.taskPreview : "",
+      MAX_TASK_METADATA_PREVIEW_CHARS
+    )
+  };
+
+  while (
+    encoder.encode(JSON.stringify(metadata)).length > MAX_TASK_METADATA_BYTES &&
+    metadata.taskPreview.length > 0
+  ) {
+    const chars = Array.from(metadata.taskPreview);
+    chars.pop();
+    metadata.taskPreview = chars.join("");
+  }
+
+  return metadata;
+}
+
 function safeTaskError(interaction: any, apiKey?: string): string | undefined {
   if (!interaction || interaction.status !== "failed") return undefined;
   const details =
@@ -917,15 +960,18 @@ export async function putTaskIndexRecord(
   record: AntigravityTaskIndexRecord
 ): Promise<void> {
   try {
-    await env.OAUTH_KV.put(taskIndexKey(record.taskId), JSON.stringify(record), {
-      expirationTtl: TASK_INDEX_TTL_SECONDS,
-      metadata: {
-        createdAt: record.createdAt,
-        status: record.status,
-        mode: record.mode,
-        taskPreview: record.taskPreview
-      }
-    });
+    const metadata = taskIndexMetadata(record);
+    const value = JSON.stringify(record);
+    await Promise.all([
+      env.OAUTH_KV.put(taskIndexKey(record.taskId), value, {
+        expirationTtl: TASK_INDEX_TTL_SECONDS,
+        metadata
+      }),
+      env.OAUTH_KV.put(taskRecentIndexKey(record.createdAt, record.taskId), value, {
+        expirationTtl: TASK_INDEX_TTL_SECONDS,
+        metadata
+      })
+    ]);
   } catch {
     warnTaskIndexFailure("unable to write task record");
   }
@@ -1128,6 +1174,26 @@ function formatTerminalTaskError(interaction: any, apiKey?: string): string {
   return JSON.stringify(payload, null, 2);
 }
 
+function formatWaitFailureResult(
+  interaction: any,
+  err: unknown,
+  apiKey?: string,
+  status = "in_progress"
+): string {
+  const reason = err instanceof Error ? err.message : String(err);
+  const payload = {
+    taskId: typeof interaction?.id === "string" ? interaction.id : undefined,
+    status,
+    done: false,
+    warning: truncateCharacters(
+      sanitizeSecret(reason, apiKey),
+      MAX_TASK_WARNING_CHARS
+    ),
+    message: `Task is still running. ${LONG_TASK_HINT}.`
+  };
+  return JSON.stringify(payload, null, 2);
+}
+
 function toTaskArgs(args: {
   task: string;
   contextFiles?: Record<string, string>;
@@ -1228,12 +1294,18 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
           repoContext
         );
 
-        interaction = await waitForInteraction(
-          env.GEMINI_API_KEY,
-          interaction,
-          (waitSeconds ?? 45) * 1000,
-          1000
-        );
+        try {
+          interaction = await waitForInteraction(
+            env.GEMINI_API_KEY,
+            interaction,
+            (waitSeconds ?? 45) * 1000,
+            1000
+          );
+        } catch (waitErr) {
+          return toolText(
+            formatWaitFailureResult(interaction, waitErr, env.GEMINI_API_KEY, "in_progress")
+          );
+        }
 
         await updateTaskIndexFromInteraction(env, interaction, env.GEMINI_API_KEY);
 
@@ -1334,12 +1406,23 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
       try {
         const validTaskId = validateTaskId(taskId);
         let interaction = await getInteraction(env.GEMINI_API_KEY, validTaskId);
-        interaction = await waitForInteraction(
-          env.GEMINI_API_KEY,
-          interaction,
-          (waitSeconds ?? 20) * 1000,
-          1000
-        );
+        try {
+          interaction = await waitForInteraction(
+            env.GEMINI_API_KEY,
+            interaction,
+            (waitSeconds ?? 20) * 1000,
+            1000
+          );
+        } catch (waitErr) {
+          return toolText(
+            formatWaitFailureResult(
+              interaction,
+              waitErr,
+              env.GEMINI_API_KEY,
+              typeof interaction?.status === "string" ? interaction.status : "in_progress"
+            )
+          );
+        }
         await updateTaskIndexFromInteraction(env, interaction, env.GEMINI_API_KEY);
         return toolText(
           formatTaskResult(interaction, {
@@ -1406,18 +1489,18 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
     async ({ limit, status }) => {
       try {
         const wantedLimit = limit ?? 20;
-        const keys: any[] = [];
+        const items: any[] = [];
         let cursor: string | undefined;
         let scanned = 0;
         let listFailed = false;
 
-        do {
+        while (items.length < wantedLimit && scanned < 1000) {
           let page: any;
           try {
             page = await env.OAUTH_KV.list({
-              prefix: TASK_INDEX_PREFIX,
+              prefix: TASK_RECENT_INDEX_PREFIX,
               cursor,
-              limit: 1000
+              limit: Math.min(1000, 1000 - scanned)
             });
           } catch {
             warnTaskIndexFailure("unable to list task records");
@@ -1427,40 +1510,36 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
 
           const pageKeys = Array.isArray(page?.keys) ? page.keys : [];
           for (const key of pageKeys) {
-            keys.push(key);
+            if (scanned >= 1000 || items.length >= wantedLimit) break;
             scanned++;
-            if (scanned >= 1000) break;
-          }
-          cursor = page?.cursor;
-          if (scanned >= 1000) break;
-        } while (cursor);
 
-        if (listFailed) {
-          return toolText(JSON.stringify({ tasks: [] }, null, 2));
-        }
-
-        const items = keys
-          .map((key) => {
             const metadata = key?.metadata && typeof key.metadata === "object" ? key.metadata : {};
+            const itemStatus = typeof metadata.status === "string" ? metadata.status : "unknown";
+            if (status && itemStatus !== status) continue;
+
             const name = typeof key?.name === "string" ? key.name : "";
-            return {
-              taskId: name.startsWith(TASK_INDEX_PREFIX)
-                ? name.slice(TASK_INDEX_PREFIX.length)
-                : name,
-              status: typeof metadata.status === "string" ? metadata.status : "unknown",
+            const suffix = name.startsWith(TASK_RECENT_INDEX_PREFIX)
+              ? name.slice(TASK_RECENT_INDEX_PREFIX.length)
+              : name;
+            const separator = suffix.indexOf(":");
+
+            items.push({
+              taskId: separator >= 0 ? suffix.slice(separator + 1) : suffix,
+              status: itemStatus,
               createdAt: typeof metadata.createdAt === "string" ? metadata.createdAt : "",
               mode: typeof metadata.mode === "string" ? metadata.mode : "plain",
               taskPreview:
                 typeof metadata.taskPreview === "string" ? metadata.taskPreview : ""
-            };
-          })
-          .filter((item) => !status || item.status === status)
-          .sort((a, b) => {
-            const aTime = Date.parse(a.createdAt);
-            const bTime = Date.parse(b.createdAt);
-            return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
-          })
-          .slice(0, wantedLimit);
+            });
+          }
+
+          cursor = page?.cursor;
+          if (!cursor) break;
+        }
+
+        if (listFailed) {
+          return toolText(JSON.stringify({ tasks: [] }, null, 2));
+        }
 
         return toolText(JSON.stringify({ tasks: items }, null, 2));
       } catch (err: any) {
