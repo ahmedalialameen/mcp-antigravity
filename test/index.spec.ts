@@ -1141,6 +1141,238 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(withRaw.usage).toEqual({ input_tokens: 3 });
     });
 
+    it("derives outputText from model_output steps and prefers the last model_output step", () => {
+      const parsed = JSON.parse(
+        formatTaskResult(
+          {
+            id: "int-derive-last",
+            status: "completed",
+            steps: [
+              { type: "thought", signature: "thought-sig", summary: [{ type: "text", text: "hidden" }] },
+              { type: "model_output", content: [{ type: "text", text: "first output" }] },
+              {
+                type: "model_output",
+                content: [
+                  { type: "text", text: "last " },
+                  { type: "text", text: "output" }
+                ]
+              }
+            ]
+          },
+          { apiKey: "derive-key" }
+        )
+      );
+
+      expect(parsed.outputText).toBe("last output");
+      expect(parsed.rawFallback).toBeUndefined();
+    });
+
+    it("joins earlier model_output text when the last model_output has no text and falls back only without model_output text", () => {
+      const joined = JSON.parse(
+        formatTaskResult(
+          {
+            id: "int-derive-join",
+            status: "completed",
+            steps: [
+              { type: "model_output", content: [{ type: "text", text: "first" }] },
+              { type: "model_output", content: [{ type: "image", mime_type: "image/jpeg" }] }
+            ]
+          },
+          { apiKey: "derive-key" }
+        )
+      );
+      expect(joined.outputText).toBe("first");
+      expect(joined.rawFallback).toBeUndefined();
+
+      const fallback = JSON.parse(
+        formatTaskResult(
+          {
+            id: "int-derive-fallback",
+            status: "completed",
+            steps: [
+              { type: "thought", signature: "thought-sig", summary: [{ type: "text", text: "hidden" }] }
+            ],
+            some_field: "raw value"
+          },
+          { apiKey: "derive-key" }
+        )
+      );
+      expect(fallback.outputText).toBeUndefined();
+      expect(fallback.rawFallback).toContain("some_field");
+      expect(fallback.rawFallback).not.toContain("thought");
+      expect(fallback.rawFallback).not.toContain("signature");
+    });
+
+    it("removes thought steps and every signature key from raw and rawFallback JSON", () => {
+      const parsed = JSON.parse(
+        formatTaskResult(
+          {
+            id: "int-scrub",
+            status: "completed",
+            output_text: "visible",
+            steps: [
+              { type: "thought", signature: "top-sig", summary: [{ type: "text", text: "hidden" }] },
+              {
+                type: "model_output",
+                content: [
+                  {
+                    type: "text",
+                    text: "visible output",
+                    annotations: [{ type: "url_citation", signature: "nested-sig" }]
+                  }
+                ]
+              },
+              {
+                type: "mcp_server_tool_result",
+                name: "lookup",
+                result: { ok: true, meta: { signature: "deep-sig" } }
+              }
+            ]
+          },
+          { includeRaw: true, includeSteps: true, apiKey: "scrub-key" }
+        )
+      );
+
+      expect(parsed.raw).not.toContain("thought");
+      expect(parsed.raw).not.toContain("signature");
+      expect(parsed.raw).not.toContain("top-sig");
+      expect(parsed.raw).not.toContain("nested-sig");
+      expect(parsed.raw).not.toContain("deep-sig");
+      expect(parsed.steps.map((step: any) => step.type)).not.toContain("thought");
+      expect(JSON.stringify(parsed.steps)).not.toContain("signature");
+
+      const rawFallback = JSON.parse(
+        formatTaskResult(
+          {
+            id: "int-scrub-fallback",
+            status: "completed",
+            steps: [{ type: "thought", signature: "fallback-sig" }],
+            metadata: { signature: "fallback-nested-sig", keep: true }
+          },
+          { apiKey: "scrub-key" }
+        )
+      );
+      expect(rawFallback.rawFallback).not.toContain("thought");
+      expect(rawFallback.rawFallback).not.toContain("signature");
+      expect(rawFallback.rawFallback).not.toContain("fallback-sig");
+      expect(rawFallback.rawFallback).toContain("keep");
+    });
+
+    it("caps includeSteps at 100 compact steps and truncates previews", () => {
+      const steps: any[] = [];
+      for (let i = 0; i < 120; i++) {
+        steps.push({
+          type: "mcp_server_tool_call",
+          name: `tool_${i}`,
+          arguments: { blob: "a".repeat(400) },
+          result: { blob: "b".repeat(600) },
+          is_error: i % 2 === 0
+        });
+      }
+      steps.splice(5, 0, {
+        type: "thought",
+        signature: "hidden-sig",
+        summary: [{ type: "text", text: "hidden" }]
+      });
+      steps[10].signature = "another-sig";
+
+      const parsed = JSON.parse(
+        formatTaskResult(
+          { id: "int-caps", status: "completed", steps },
+          { includeSteps: true, apiKey: "caps-key" }
+        )
+      );
+
+      expect(parsed.steps.length).toBe(100);
+      expect(parsed.steps[0].type).toBe("mcp_server_tool_call");
+      expect(parsed.steps[0].name).toBe("tool_0");
+      expect(parsed.steps[0].is_error).toBe(true);
+      expect(parsed.steps[0].argsPreview.length).toBe(300);
+      expect(parsed.steps[0].resultPreview.length).toBe(500);
+      expect(Object.keys(parsed.steps[0]).sort()).toEqual([
+        "argsPreview",
+        "is_error",
+        "name",
+        "resultPreview",
+        "type"
+      ]);
+      expect(parsed.steps.map((step: any) => step.type)).not.toContain("thought");
+      expect(JSON.stringify(parsed.steps)).not.toContain("signature");
+    });
+
+    it("get_antigravity_task includes compact steps only when includeSteps is true", async () => {
+      const handler = await makeHandler();
+      const steps = [
+        { type: "model_output", content: [{ type: "text", text: "done" }] },
+        {
+          type: "mcp_server_tool_call",
+          name: "lookup",
+          arguments: { query: "target" },
+          result: { value: "found" }
+        },
+        { type: "thought", signature: "hidden-sig" }
+      ];
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+        return Response.json(
+          { id: "int-include-steps", status: "completed", output_text: "done", steps },
+          { status: 200 }
+        );
+      });
+
+      const without = await callTool(handler, "get_antigravity_task", {
+        taskId: "int-include-steps",
+        waitSeconds: 0
+      });
+      expect(without.isError).toBe(false);
+      expect(without.data.steps).toBeUndefined();
+
+      const withSteps = await callTool(handler, "get_antigravity_task", {
+        taskId: "int-include-steps",
+        waitSeconds: 0,
+        includeSteps: true
+      });
+      expect(withSteps.isError).toBe(false);
+      expect(Array.isArray(withSteps.data.steps)).toBe(true);
+      expect(withSteps.data.steps.map((step: any) => step.type)).not.toContain("thought");
+      expect(withSteps.data.steps[1].name).toBe("lookup");
+      expect(withSteps.data.steps[1].argsPreview).toContain("target");
+      expect(withSteps.data.steps[1].resultPreview).toContain("found");
+      expect(JSON.stringify(withSteps.data.steps)).not.toContain("signature");
+    });
+
+    it("redacts API keys from derived output, raw JSON, and compact step previews", () => {
+      const secret = "STEP_SECRET_API_KEY_abc123";
+      const parsed = JSON.parse(
+        formatTaskResult(
+          {
+            id: "int-step-secret",
+            status: "completed",
+            steps: [
+              {
+                type: "model_output",
+                content: [{ type: "text", text: `Output ${secret}` }]
+              },
+              {
+                type: "mcp_server_tool_call",
+                name: "tool",
+                arguments: { token: secret },
+                result: { text: `Result ${secret}` },
+                signature: secret
+              }
+            ],
+            metadata: { signature: `nested ${secret}` }
+          },
+          { includeRaw: true, includeSteps: true, apiKey: secret }
+        )
+      );
+
+      expect(parsed.outputText).toBe("Output [REDACTED_API_KEY]");
+      expect(parsed.steps[1].argsPreview).toContain("[REDACTED_API_KEY]");
+      expect(parsed.steps[1].resultPreview).toContain("[REDACTED_API_KEY]");
+      expect(JSON.stringify(parsed)).not.toContain(secret);
+      expect(JSON.stringify(parsed)).not.toContain("signature");
+    });
+
     it("never returns the API key in results, errors, or console warnings", async () => {
       const secret = "DISTINCTIVE_TASK_API_KEY_9f8e7d6c";
       const failingKv = {
