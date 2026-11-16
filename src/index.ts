@@ -543,6 +543,9 @@ async function buildInteractionPayload(
           {
             domain: "github.com",
             credential: credId
+          },
+          {
+            domain: "rubygems.org"
           }
         ]
       }
@@ -569,7 +572,8 @@ async function buildInteractionPayload(
       "\n\nGitHub Access:\n" +
       "- Reach GitHub only from inside the sandbox using curl or git against api.github.com and github.com.\n" +
       "- Authentication is added automatically by a proxy. Never set, override, or supply an Authorization header. Never print, echo, or search for tokens or secrets.\n" +
-      `- Only touch the named repository '${repoContext.repository}'. Do not access any other repository or account.\n`;
+      `- Only touch the named repository '${repoContext.repository}'. Do not access any other repository or account.\n` +
+      "- Package metadata: the sandbox may also read public package metadata from rubygems.org with GET requests only (for example https://rubygems.org/api/v2/rubygems/<gem>/versions/<version>.json) and must never send repository content or any other data to it.\n";
 
     if (repoContext.mode === "implement") {
       const explicitBase = repoContext.baseBranch

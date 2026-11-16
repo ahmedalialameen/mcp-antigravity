@@ -5,7 +5,7 @@ A remote Model Context Protocol (MCP) server deployed on Cloudflare Workers. It 
 ## Features
 
 - **Google Antigravity Integration**: Connects to Google's official Interactions API endpoint `https://generativelanguage.googleapis.com/v1beta/interactions` using the supported agent identifier `antigravity-preview-09-2026` and official `x-goog-api-key: <GEMINI_API_KEY>` header.
-- **GitHub Sandbox Access**: Repository tasks reach GitHub only with `curl` or `git` inside the Google Antigravity sandbox. The Worker restricts sandbox egress to `api.github.com` and `github.com` using Google-managed credential IDs; authentication is injected automatically by the egress proxy.
+- **GitHub Sandbox Access**: Repository tasks reach GitHub only with `curl` or `git` inside the Google Antigravity sandbox. The Worker restricts sandbox egress to `api.github.com` and `github.com` using Google-managed credential IDs; authentication is injected automatically by the egress proxy. The sandbox may also make unauthenticated, GET-only requests to `rubygems.org` to read public package metadata, and must never send repository content or any other data to it.
 - **Controlled Operational Modes**: Restricts repository access across 4 explicit modes (`inspect`, `review`, `propose`, `implement`) using per-mode credential selection and a mode-specific system instruction. Read modes are GET-only; `implement` may only create a short-lived branch and open a draft pull request.
 - **MCP Server & Async Task Tools**: Implements `run_antigravity_agent`, `start_antigravity_task`, `get_antigravity_task`, `cancel_antigravity_task`, and `list_antigravity_tasks` via official SDK v2 (`@modelcontextprotocol/server`). Tasks run in Google background mode (`background: true`, `store: true`) so long-running work can outlive a single MCP request.
 - **Stateless Web-Standard MCP Transport**: Exposes the primary remote MCP endpoint at `/mcp` via `createMcpHandler()`, providing native support for MCP 2026-07-28 and 2025 stateless fallback over POST without requiring transport session state.
@@ -138,6 +138,7 @@ To enable repository-scoped software engineering tasks against GitHub repositori
                                                            ┌───────────────────────────┐
                                                            │ api.github.com            │
                                                            │ github.com                │
+                                                           │ rubygems.org (GET only)   │
                                                            └───────────────────────────┘
 ```
 
@@ -364,7 +365,7 @@ Lists indexed tasks newest first with `taskId`, `status`, `createdAt`, `mode`, a
 | `propose` | Read-only (suggest patches) | `GITHUB_MCP_READ_CREDENTIAL_ID` | GET requests only against `api.github.com` / `github.com` |
 | `implement` | Controlled write | `GITHUB_MCP_WRITE_CREDENTIAL_ID` | Commit on a new `antigravity/<short-slug>` branch and open a draft pull request |
 
-**Native Capabilities Preserved**: In all repository modes, native agent tools (`code_execution`, `google_search`, `url_context`) and inline files (`contextFiles` under `environment.sources`) remain active. The sandbox egress allowlist contains exactly `api.github.com` and `github.com`, with authentication injected automatically by the proxy. Stateful tool calling is maintained with `"store": true`.
+**Native Capabilities Preserved**: In all repository modes, native agent tools (`code_execution`, `google_search`, `url_context`) and inline files (`contextFiles` under `environment.sources`) remain active. The sandbox egress allowlist contains exactly `api.github.com` and `github.com`, with authentication injected automatically by the proxy, followed by an unauthenticated `rubygems.org` entry for GET-only public package metadata. Stateful tool calling is maintained with `"store": true`.
 
 **Implementation Task Workflow**:
 When `mode: "implement"` is specified, Antigravity follows a strictly defined lifecycle:

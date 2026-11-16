@@ -3624,7 +3624,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(mcpText).not.toContain("isError\":true");
     });
 
-    it("2. 'inspect', 'review', and 'propose' use the read credential, attach no mcp_server tool, and allow only the two GitHub domains", async () => {
+    it("2. 'inspect', 'review', and 'propose' use the read credential, attach no mcp_server tool, and allow the two GitHub domains plus rubygems.org", async () => {
       const modes = ["inspect", "review", "propose"] as const;
 
       for (const mode of modes) {
@@ -3656,7 +3656,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
           network: {
             allowlist: [
               { domain: "api.github.com", credential: "cred-github-read-123" },
-              { domain: "github.com", credential: "cred-github-read-123" }
+              { domain: "github.com", credential: "cred-github-read-123" },
+              { domain: "rubygems.org" }
             ]
           }
         });
@@ -3734,7 +3735,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         network: {
           allowlist: [
             { domain: "api.github.com", credential: "cred-github-write-456" },
-            { domain: "github.com", credential: "cred-github-write-456" }
+            { domain: "github.com", credential: "cred-github-write-456" },
+            { domain: "rubygems.org" }
           ]
         }
       });
@@ -3904,7 +3906,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       });
     });
 
-    it("9. The interaction payload sets 'store: true', preserves 'environment.sources', and uses the two-domain GitHub allowlist", async () => {
+    it("9. The interaction payload sets 'store: true', preserves 'environment.sources', and uses the GitHub plus rubygems.org allowlist", async () => {
       let sentPayload: any = null;
       vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (_url, init) => {
         sentPayload = JSON.parse(init?.body as string);
@@ -3947,7 +3949,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         network: {
           allowlist: [
             { domain: "api.github.com", credential: "cred-github-write-456" },
-            { domain: "github.com", credential: "cred-github-write-456" }
+            { domain: "github.com", credential: "cred-github-write-456" },
+            { domain: "rubygems.org" }
           ]
         }
       });
@@ -3971,6 +3974,81 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(sentPayload.input).toContain("Pull Request: #1234");
       expect(sentPayload.input).toContain("Base Branch: main");
       expect(sentPayload.input).toContain("Comprehensive implementation task");
+    });
+
+    it("9b. Repository modes append an unauthenticated rubygems.org entry after the two GitHub entries and instruct GET-only metadata access", async () => {
+      const modes = ["inspect", "review", "propose", "implement"] as const;
+      const credentialByMode: Record<(typeof modes)[number], string> = {
+        inspect: "cred-github-read-123",
+        review: "cred-github-read-123",
+        propose: "cred-github-read-123",
+        implement: "cred-github-write-456"
+      };
+
+      for (const mode of modes) {
+        let sentPayload: any = null;
+        vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return Response.json({ id: `int-rubygems-${mode}`, status: "completed" }, { status: 200 });
+        });
+
+        await callAntigravityAgent(
+          "fake-key",
+          "Read package metadata",
+          undefined,
+          undefined,
+          { repository: "owner/my-repo", mode },
+          defaultTestEnv as any
+        );
+
+        const allowlist = sentPayload.environment.network.allowlist;
+        expect(allowlist).toHaveLength(3);
+        expect(allowlist[0]).toEqual({
+          domain: "api.github.com",
+          credential: credentialByMode[mode]
+        });
+        expect(allowlist[1]).toEqual({
+          domain: "github.com",
+          credential: credentialByMode[mode]
+        });
+        expect(allowlist[2]).toEqual({ domain: "rubygems.org" });
+        expect("credential" in allowlist[2]).toBe(false);
+        expect(Object.keys(allowlist[2])).toEqual(["domain"]);
+
+        expect(sentPayload.system_instruction).toContain(
+          "the sandbox may also read public package metadata from rubygems.org with GET requests only (for example https://rubygems.org/api/v2/rubygems/<gem>/versions/<version>.json) and must never send repository content or any other data to it."
+        );
+      }
+    });
+
+    it("9c. Non-repository payloads are unchanged and never include the rubygems.org network allowlist", async () => {
+      let sentPayload: any = null;
+      vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (_url, init) => {
+        sentPayload = JSON.parse(init?.body as string);
+        return Response.json({ id: "int-non-repo", status: "completed" }, { status: 200 });
+      });
+
+      await callAntigravityAgent("fake-key", "Generic file task", {
+        "notes.txt": "plain content"
+      });
+
+      expect(sentPayload).toEqual({
+        agent: "antigravity-preview-09-2026",
+        input: "Generic file task",
+        environment: {
+          type: "remote",
+          sources: [
+            {
+              type: "inline",
+              target: "/workspace/notes.txt",
+              content: "plain content"
+            }
+          ]
+        }
+      });
+      expect(sentPayload.environment.network).toBeUndefined();
+      expect(sentPayload.system_instruction).toBeUndefined();
+      expect(JSON.stringify(sentPayload)).not.toContain("rubygems.org");
     });
 
     it("10. The actual GitHub token value never appears in the generated payload, prompt, error response, or logs", async () => {
@@ -5160,7 +5238,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(payload.tools.find((tool: any) => tool.type === "mcp_server")).toBeUndefined();
       expect(payload.environment.network.allowlist).toEqual([
         { domain: "api.github.com", credential: "env-read" },
-        { domain: "github.com", credential: "env-read" }
+        { domain: "github.com", credential: "env-read" },
+        { domain: "rubygems.org" }
       ]);
 
       await createInteraction(
@@ -5175,7 +5254,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(payload.tools.find((tool: any) => tool.type === "mcp_server")).toBeUndefined();
       expect(payload.environment.network.allowlist).toEqual([
         { domain: "api.github.com", credential: "env-write" },
-        { domain: "github.com", credential: "env-write" }
+        { domain: "github.com", credential: "env-write" },
+        { domain: "rubygems.org" }
       ]);
 
       const kvOnlyEnv = adminEnv({
@@ -5195,7 +5275,8 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
       expect(payload.tools.find((tool: any) => tool.type === "mcp_server")).toBeUndefined();
       expect(payload.environment.network.allowlist).toEqual([
         { domain: "api.github.com", credential: "kv-read" },
-        { domain: "github.com", credential: "kv-read" }
+        { domain: "github.com", credential: "kv-read" },
+        { domain: "rubygems.org" }
       ]);
 
       const noCredentialEnv = adminEnv({
