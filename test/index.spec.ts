@@ -605,7 +605,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
           task: "Poll failures",
           waitSeconds: 20
         });
-        await vi.advanceTimersByTimeAsync(5000);
+        await vi.advanceTimersByTimeAsync(10000);
         const result = await pending;
 
         expect(fetchSpy).toHaveBeenCalledTimes(4);
@@ -642,7 +642,7 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
           taskId: "int-get-poll-fail",
           waitSeconds: 20
         });
-        await vi.advanceTimersByTimeAsync(5000);
+        await vi.advanceTimersByTimeAsync(10000);
         const result = await pending;
 
         expect(fetchSpy).toHaveBeenCalledTimes(4);
@@ -653,6 +653,104 @@ describe("Cloudflare Workers MCP Server for Google Antigravity Agent", () => {
         expect(result.data.warning).toContain("polling backend unavailable");
         expect(result.text).toContain("get_antigravity_task");
       } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("run_antigravity_agent backs off polling and returns in_progress within 20 GETs for a 90 second wait", async () => {
+      vi.useFakeTimers();
+      try {
+        const handler = await makeHandler();
+        let getCalls = 0;
+        vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+          if (init?.method === "GET") {
+            getCalls++;
+          }
+          return Response.json(
+            { id: "int-run-never", status: "in_progress" },
+            { status: 200 }
+          );
+        });
+
+        const pending = callTool(handler, "run_antigravity_agent", {
+          task: "Never finishes",
+          waitSeconds: 90
+        });
+        await vi.advanceTimersByTimeAsync(90000);
+        const result = await pending;
+
+        expect(getCalls).toBeGreaterThan(0);
+        expect(getCalls).toBeLessThanOrEqual(20);
+        expect(result.isError).toBe(false);
+        expect(result.data.taskId).toBe("int-run-never");
+        expect(result.data.status).toBe("in_progress");
+        expect(result.data.done).toBe(false);
+        expect(result.text).toContain("get_antigravity_task");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("waitForInteraction stops at the subrequest budget and returns the latest in_progress interaction", async () => {
+      vi.useFakeTimers();
+      try {
+        let getCalls = 0;
+        vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+          getCalls++;
+          return Response.json(
+            { id: "int-budget", status: "in_progress" },
+            { status: 200 }
+          );
+        });
+
+        const pending = waitForInteraction(
+          "fake_key",
+          { id: "int-budget", status: "in_progress" },
+          90000,
+          1,
+          { maxSubrequests: 5 }
+        );
+        await vi.advanceTimersByTimeAsync(90000);
+        const result = await pending;
+
+        expect(getCalls).toBe(5);
+        expect(result.id).toBe("int-budget");
+        expect(result.status).toBe("in_progress");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("run_antigravity_agent returns in_progress when the wait budget is exhausted", async () => {
+      vi.useFakeTimers();
+      const nowSpy = vi.spyOn(Date, "now").mockReturnValue(0);
+      try {
+        const handler = await makeHandler();
+        let getCalls = 0;
+        vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+          if (init?.method === "GET") {
+            getCalls++;
+          }
+          return Response.json(
+            { id: "int-run-budget", status: "in_progress" },
+            { status: 200 }
+          );
+        });
+
+        const pending = callTool(handler, "run_antigravity_agent", {
+          task: "Budget exhaustion",
+          waitSeconds: 90
+        });
+        await vi.advanceTimersByTimeAsync(200000);
+        const result = await pending;
+
+        expect(getCalls).toBe(25);
+        expect(result.isError).toBe(false);
+        expect(result.data.taskId).toBe("int-run-budget");
+        expect(result.data.status).toBe("in_progress");
+        expect(result.data.done).toBe(false);
+      } finally {
+        nowSpy.mockRestore();
         vi.useRealTimers();
       }
     });

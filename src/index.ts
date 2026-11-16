@@ -326,6 +326,12 @@ export const MAX_TASK_METADATA_PREVIEW_CHARS = 120;
 export const MAX_TASK_METADATA_BYTES = 800;
 export const MAX_TASK_WARNING_CHARS = 200;
 export const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+export const DEFAULT_POLL_INTERVAL_MS = 2000;
+export const POLL_BACKOFF_MULTIPLIER = 1.5;
+export const MAX_POLL_INTERVAL_MS = 8000;
+export const MAX_WAIT_SUBREQUESTS = 30;
+export const RUN_AGENT_INDEX_SUBREQUEST_RESERVE = 5;
+export const GET_TASK_INDEX_SUBREQUEST_RESERVE = 4;
 export const MAX_TASK_ERROR_CHARS = 500;
 export const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
 const REVERSE_TIMESTAMP_MAX = 9999999999999;
@@ -764,16 +770,22 @@ export async function cancelInteraction(
   return data;
 }
 
+export interface WaitForInteractionOptions {
+  maxSubrequests?: number;
+  subrequestsUsed?: number;
+}
+
 /**
  * Polls an interaction until it reaches a terminal status or the deadline
  * passes. Returns the latest interaction either way and never throws merely
- * because the deadline was reached.
+ * because the deadline or the subrequest budget was reached.
  */
 export async function waitForInteraction(
   apiKey: string,
   interaction: any,
   waitMs = 0,
-  pollIntervalMs = 1000
+  pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+  options?: WaitForInteractionOptions | number
 ): Promise<any> {
   let data = interaction;
   if (!data || typeof data !== "object") {
@@ -781,11 +793,24 @@ export async function waitForInteraction(
   }
 
   const deadline = Date.now() + Math.max(0, waitMs);
-  const interval = Math.max(0, pollIntervalMs);
+  let interval = Math.max(0, pollIntervalMs);
+  const maxSubrequests = Math.max(
+    0,
+    typeof options === "number"
+      ? options
+      : options?.maxSubrequests ?? MAX_WAIT_SUBREQUESTS
+  );
+  let subrequestsUsed =
+    typeof options === "object" && options
+      ? Math.max(0, options.subrequestsUsed ?? 0)
+      : 0;
   let consecutiveFailures = 0;
 
   while (!isTerminalInteractionStatus(data.status) && Date.now() < deadline) {
     if (!data.id) {
+      break;
+    }
+    if (subrequestsUsed >= maxSubrequests) {
       break;
     }
     const remaining = deadline - Date.now();
@@ -793,6 +818,7 @@ export async function waitForInteraction(
       break;
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(interval, remaining)));
+    subrequestsUsed++;
     try {
       data = await getInteraction(apiKey, String(data.id));
       consecutiveFailures = 0;
@@ -802,6 +828,7 @@ export async function waitForInteraction(
         throw err;
       }
     }
+    interval = Math.min(interval * POLL_BACKOFF_MULTIPLIER, MAX_POLL_INTERVAL_MS);
   }
 
   return data;
@@ -828,7 +855,7 @@ export async function callAntigravityAgent(
 
   const timeoutMs = options?.timeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS;
   const maxPollTimeMs = options?.maxPollTimeMs ?? 120000;
-  const pollIntervalMs = options?.maxPollIntervalMs ?? 1000;
+  const pollIntervalMs = options?.maxPollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
 
   const payload = await buildInteractionPayload(prompt, workspaceFiles, repoContext, env, {
     storeOption: options?.store
@@ -1490,7 +1517,8 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
             env.GEMINI_API_KEY,
             interaction,
             (waitSeconds ?? 45) * 1000,
-            1000
+            DEFAULT_POLL_INTERVAL_MS,
+            { subrequestsUsed: RUN_AGENT_INDEX_SUBREQUEST_RESERVE }
           );
         } catch (waitErr) {
           return toolText(
@@ -1606,7 +1634,8 @@ export function createAntigravityMcpServer(env: Env, authInfo?: AuthInfo) {
             env.GEMINI_API_KEY,
             interaction,
             (waitSeconds ?? 20) * 1000,
-            1000
+            DEFAULT_POLL_INTERVAL_MS,
+            { subrequestsUsed: GET_TASK_INDEX_SUBREQUEST_RESERVE }
           );
         } catch (waitErr) {
           return toolText(
